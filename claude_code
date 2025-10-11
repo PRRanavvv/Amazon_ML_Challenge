@@ -1,0 +1,1201 @@
+# Large-Scale Semi-Supervised Image-to-Price Regression
+# Optimized for 255k train + 90k test images with noisy labels
+# TensorFlow 2.x + Keras | GPU-optimized | Offline pipeline
+
+"""
+## 📋 Dataset Structure
+- Train: 255,900 images
+- Test: 90,600 images
+- CSV columns: id, image_path, price (float target, may contain noisy labels)
+"""
+
+# ============================================================================
+# 1. INSTALLATION & IMPORTS
+# ============================================================================
+
+# Uncomment for Colab installation
+# !pip install -q tensorflow>=2.13.0
+# !pip install -q tensorflow-addons
+# !pip install -q efficientnet
+# !pip install -q scikit-learn
+# !pip install -q matplotlib seaborn
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, models, callbacks
+import tensorflow_addons as tfa
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from pathlib import Path
+import os
+import json
+from typing import Tuple, Dict, Optional
+import warnings
+warnings.filterwarnings('ignore')
+
+# Enable mixed precision for faster training
+from tensorflow.keras import mixed_precision
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
+print(f'Mixed precision enabled: {policy.name}')
+
+# GPU configuration
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f'GPUs available: {len(gpus)}')
+    except RuntimeError as e:
+        print(e)
+
+# Set random seeds
+tf.random.set_seed(42)
+np.random.seed(42)
+
+print(f'TensorFlow version: {tf.__version__}')
+print(f'Keras version: {keras.__version__}')
+
+
+# ============================================================================
+# 2. CONFIGURATION
+# ============================================================================
+
+class Config:
+    """Central configuration for the entire pipeline"""
+    
+    # Data paths (REPLACE WITH YOUR ACTUAL PATHS)
+    TRAIN_CSV = 'train.csv'  # Columns: id, image_path, price
+    TEST_CSV = 'test.csv'
+    IMAGE_DIR = 'images/'  # Base directory for images
+    
+    # Model checkpoints
+    CHECKPOINT_DIR = 'checkpoints/'
+    BEST_MODEL_PATH = 'checkpoints/best_model.h5'
+    EMBEDDINGS_DIR = 'embeddings/'
+    
+    # Image settings
+    IMG_SIZE = 224
+    IMG_SHAPE = (IMG_SIZE, IMG_SIZE, 3)
+    
+    # Training hyperparameters
+    BATCH_SIZE = 32
+    EPOCHS_FROZEN = 10  # Epochs with frozen backbone
+    EPOCHS_FINETUNE = 20  # Epochs for fine-tuning
+    LEARNING_RATE = 1e-4
+    FINETUNE_LR = 1e-5
+    
+    # Semi-supervised settings
+    USE_PSEUDO_LABELS = True
+    PSEUDO_LABEL_THRESHOLD = 0.8  # Confidence threshold
+    NOISE_THRESHOLD = 3.0  # Std multiplier for outlier detection
+    
+    # Model architecture
+    BACKBONE = 'efficientnetv2-b2'  # Options: efficientnetv2-b0/b1/b2, vit-b16
+    UNFREEZE_LAYERS = 50  # Number of layers to unfreeze for fine-tuning
+    DROPOUT_RATE = 0.3
+    
+    # Regularization
+    L2_REG = 1e-4
+    
+    # Data augmentation
+    AUGMENT_TRAIN = True
+    
+    # Performance
+    CACHE_DATA = True
+    PREFETCH_SIZE = tf.data.AUTOTUNE
+    NUM_PARALLEL_CALLS = tf.data.AUTOTUNE
+
+config = Config()
+os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(config.EMBEDDINGS_DIR, exist_ok=True)
+
+
+# ============================================================================
+# 3. DATA LOADING & PREPROCESSING
+# ============================================================================
+
+class DataLoader:
+    """Handles data loading, validation, and preprocessing"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        
+    def load_csv(self, csv_path: str, is_train: bool = True) -> pd.DataFrame:
+        """Load and validate CSV data"""
+        df = pd.read_csv(csv_path)
+        print(f"\nLoaded {csv_path}: {len(df)} samples")
+        
+        # Validate columns
+        required_cols = ['id', 'image_path']
+        if is_train:
+            required_cols.append('price')
+        
+        missing_cols = set(required_cols) - set(df.columns)
+        if missing_cols:
+            raise ValueError(f"Missing columns: {missing_cols}")
+        
+        # Add full image paths
+        df['full_path'] = df['image_path'].apply(
+            lambda x: os.path.join(self.config.IMAGE_DIR, x)
+        )
+        
+        # Validate image files exist (sample check)
+        sample_paths = df['full_path'].sample(min(100, len(df)))
+        missing = [p for p in sample_paths if not os.path.exists(p)]
+        if missing:
+            print(f"WARNING: {len(missing)} sample images not found")
+        
+        if is_train:
+            # Handle missing prices
+            df['price'].fillna(df['price'].median(), inplace=True)
+            
+            # Detect and flag noisy labels (outliers)
+            price_mean = df['price'].mean()
+            price_std = df['price'].std()
+            df['is_outlier'] = np.abs(df['price'] - price_mean) > (
+                self.config.NOISE_THRESHOLD * price_std
+            )
+            
+            outlier_count = df['is_outlier'].sum()
+            print(f"Detected {outlier_count} potential noisy labels "
+                  f"({100*outlier_count/len(df):.2f}%)")
+            print(f"Price statistics: mean={price_mean:.2f}, std={price_std:.2f}, "
+                  f"min={df['price'].min():.2f}, max={df['price'].max():.2f}")
+        
+        return df
+    
+    def get_dataset_stats(self, df: pd.DataFrame) -> Dict:
+        """Compute dataset statistics for normalization"""
+        stats = {
+            'price_mean': df['price'].mean(),
+            'price_std': df['price'].std(),
+            'price_min': df['price'].min(),
+            'price_max': df['price'].max(),
+            'count': len(df)
+        }
+        return stats
+
+
+class DataPipeline:
+    """TF data pipeline for efficient streaming"""
+    
+    def __init__(self, config: Config, price_stats: Dict):
+        self.config = config
+        self.price_mean = price_stats['price_mean']
+        self.price_std = price_stats['price_std']
+        
+    def load_and_preprocess_image(self, path: str, label: float):
+        """Load and preprocess a single image"""
+        # Load image
+        img = tf.io.read_file(path)
+        img = tf.image.decode_jpeg(img, channels=3)
+        img = tf.image.resize(img, [self.config.IMG_SIZE, self.config.IMG_SIZE])
+        img = img / 255.0  # Normalize to [0, 1]
+        
+        return img, label
+    
+    def augment_image(self, img: tf.Tensor, label: tf.Tensor):
+        """Apply data augmentation"""
+        # Random horizontal flip
+        img = tf.image.random_flip_left_right(img)
+        
+        # Random brightness and contrast
+        img = tf.image.random_brightness(img, max_delta=0.1)
+        img = tf.image.random_contrast(img, lower=0.9, upper=1.1)
+        
+        # Random rotation (small)
+        img = tfa.image.rotate(
+            img, 
+            tf.random.uniform([], -0.1, 0.1),
+            interpolation='bilinear'
+        )
+        
+        # Ensure values stay in [0, 1]
+        img = tf.clip_by_value(img, 0.0, 1.0)
+        
+        return img, label
+    
+    def normalize_price(self, price: float) -> float:
+        """Normalize price using z-score"""
+        return (price - self.price_mean) / (self.price_std + 1e-8)
+    
+    def denormalize_price(self, normalized_price):
+        """Convert normalized price back to original scale"""
+        return (normalized_price * self.price_std) + self.price_mean
+    
+    def create_dataset(
+        self, 
+        df: pd.DataFrame, 
+        is_training: bool = True,
+        shuffle: bool = True
+    ) -> tf.data.Dataset:
+        """Create optimized tf.data.Dataset"""
+        
+        # Extract paths and labels
+        paths = df['full_path'].values
+        
+        if 'price' in df.columns:
+            prices = df['price'].values
+            # Normalize prices
+            prices = (prices - self.price_mean) / (self.price_std + 1e-8)
+        else:
+            prices = np.zeros(len(paths))  # Dummy labels for test
+        
+        # Create dataset
+        dataset = tf.data.Dataset.from_tensor_slices((paths, prices))
+        
+        if shuffle:
+            dataset = dataset.shuffle(buffer_size=10000, seed=42)
+        
+        # Load and preprocess images
+        dataset = dataset.map(
+            self.load_and_preprocess_image,
+            num_parallel_calls=self.config.NUM_PARALLEL_CALLS
+        )
+        
+        # Apply augmentation for training
+        if is_training and self.config.AUGMENT_TRAIN:
+            dataset = dataset.map(
+                self.augment_image,
+                num_parallel_calls=self.config.NUM_PARALLEL_CALLS
+            )
+        
+        # Batch and prefetch
+        dataset = dataset.batch(self.config.BATCH_SIZE)
+        
+        if self.config.CACHE_DATA:
+            dataset = dataset.cache()
+        
+        dataset = dataset.prefetch(self.config.PREFETCH_SIZE)
+        
+        return dataset
+
+
+# ============================================================================
+# 4. MODEL ARCHITECTURE
+# ============================================================================
+
+class PriceRegressionModel:
+    """Model builder with pretrained backbones"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        
+    def build_efficientnet_model(self, trainable_backbone: bool = False):
+        """Build EfficientNetV2 based model"""
+        
+        # Input layer
+        inputs = layers.Input(shape=self.config.IMG_SHAPE, name='image_input')
+        
+        # Backbone
+        if self.config.BACKBONE == 'efficientnetv2-b0':
+            backbone = keras.applications.EfficientNetV2B0(
+                include_top=False,
+                weights='imagenet',
+                input_tensor=inputs,
+                pooling='avg'
+            )
+        elif self.config.BACKBONE == 'efficientnetv2-b1':
+            backbone = keras.applications.EfficientNetV2B1(
+                include_top=False,
+                weights='imagenet',
+                input_tensor=inputs,
+                pooling='avg'
+            )
+        elif self.config.BACKBONE == 'efficientnetv2-b2':
+            backbone = keras.applications.EfficientNetV2B2(
+                include_top=False,
+                weights='imagenet',
+                input_tensor=inputs,
+                pooling='avg'
+            )
+        else:
+            raise ValueError(f"Unknown backbone: {self.config.BACKBONE}")
+        
+        backbone.trainable = trainable_backbone
+        
+        # Regression head
+        x = backbone.output
+        x = layers.Dense(
+            512, 
+            activation='relu',
+            kernel_regularizer=keras.regularizers.l2(self.config.L2_REG),
+            name='dense_1'
+        )(x)
+        x = layers.Dropout(self.config.DROPOUT_RATE, name='dropout_1')(x)
+        
+        x = layers.Dense(
+            256, 
+            activation='relu',
+            kernel_regularizer=keras.regularizers.l2(self.config.L2_REG),
+            name='dense_2'
+        )(x)
+        x = layers.Dropout(self.config.DROPOUT_RATE, name='dropout_2')(x)
+        
+        x = layers.Dense(
+            64, 
+            activation='relu',
+            kernel_regularizer=keras.regularizers.l2(self.config.L2_REG),
+            name='dense_3'
+        )(x)
+        
+        # Output layer (float32 for numerical stability)
+        outputs = layers.Dense(1, dtype='float32', name='price_output')(x)
+        
+        model = models.Model(inputs=inputs, outputs=outputs, name='price_regressor')
+        
+        return model
+    
+    def unfreeze_top_layers(self, model, num_layers: int):
+        """Unfreeze top N layers of the backbone for fine-tuning"""
+        # Find backbone
+        backbone = None
+        for layer in model.layers:
+            if 'efficientnet' in layer.name.lower():
+                backbone = layer
+                break
+        
+        if backbone is None:
+            print("WARNING: Could not find backbone layer")
+            return
+        
+        # Freeze all layers first
+        for layer in backbone.layers:
+            layer.trainable = False
+        
+        # Unfreeze top N layers
+        for layer in backbone.layers[-num_layers:]:
+            if not isinstance(layer, layers.BatchNormalization):
+                layer.trainable = True
+        
+        trainable_count = sum([1 for l in backbone.layers if l.trainable])
+        print(f"Unfroze {trainable_count} layers in backbone for fine-tuning")
+
+
+def huber_loss(y_true, y_pred, delta=1.0):
+    """Huber loss - robust to outliers"""
+    error = y_true - y_pred
+    is_small_error = tf.abs(error) <= delta
+    squared_loss = 0.5 * tf.square(error)
+    linear_loss = delta * (tf.abs(error) - 0.5 * delta)
+    return tf.where(is_small_error, squared_loss, linear_loss)
+
+
+# ============================================================================
+# 5. TRAINING PIPELINE
+# ============================================================================
+
+class Trainer:
+    """Training orchestration with stage-wise learning"""
+    
+    def __init__(self, config: Config, model_builder: PriceRegressionModel):
+        self.config = config
+        self.model_builder = model_builder
+        self.model = None
+        self.history = {'frozen': None, 'finetune': None}
+        
+    def create_callbacks(self, stage: str):
+        """Create training callbacks"""
+        checkpoint_path = os.path.join(
+            self.config.CHECKPOINT_DIR, 
+            f'{stage}_best_model.h5'
+        )
+        
+        callback_list = [
+            callbacks.ModelCheckpoint(
+                checkpoint_path,
+                monitor='val_loss',
+                save_best_only=True,
+                save_weights_only=False,
+                mode='min',
+                verbose=1
+            ),
+            callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=5,
+                restore_best_weights=True,
+                verbose=1
+            ),
+            callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=3,
+                min_lr=1e-7,
+                verbose=1
+            ),
+            callbacks.TensorBoard(
+                log_dir=f'logs/{stage}',
+                histogram_freq=0
+            )
+        ]
+        
+        return callback_list
+    
+    def train_frozen(self, train_ds, val_ds):
+        """Stage 1: Train with frozen backbone"""
+        print("\n" + "="*70)
+        print("STAGE 1: Training with Frozen Backbone")
+        print("="*70)
+        
+        # Build model
+        self.model = self.model_builder.build_efficientnet_model(
+            trainable_backbone=False
+        )
+        
+        # Compile
+        self.model.compile(
+            optimizer=keras.optimizers.Adam(self.config.LEARNING_RATE),
+            loss=huber_loss,
+            metrics=['mae', 'mse']
+        )
+        
+        print(f"\nTotal parameters: {self.model.count_params():,}")
+        trainable_params = sum([
+            tf.size(w).numpy() for w in self.model.trainable_weights
+        ])
+        print(f"Trainable parameters: {trainable_params:,}")
+        
+        # Train
+        self.history['frozen'] = self.model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=self.config.EPOCHS_FROZEN,
+            callbacks=self.create_callbacks('frozen'),
+            verbose=1
+        )
+        
+        return self.history['frozen']
+    
+    def train_finetune(self, train_ds, val_ds):
+        """Stage 2: Fine-tune with unfrozen layers"""
+        print("\n" + "="*70)
+        print("STAGE 2: Fine-Tuning with Unfrozen Layers")
+        print("="*70)
+        
+        if self.model is None:
+            raise ValueError("Must run train_frozen first")
+        
+        # Unfreeze top layers
+        self.model_builder.unfreeze_top_layers(
+            self.model, 
+            self.config.UNFREEZE_LAYERS
+        )
+        
+        # Recompile with lower learning rate
+        self.model.compile(
+            optimizer=keras.optimizers.Adam(self.config.FINETUNE_LR),
+            loss=huber_loss,
+            metrics=['mae', 'mse']
+        )
+        
+        trainable_params = sum([
+            tf.size(w).numpy() for w in self.model.trainable_weights
+        ])
+        print(f"Trainable parameters after unfreezing: {trainable_params:,}")
+        
+        # Train
+        self.history['finetune'] = self.model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=self.config.EPOCHS_FINETUNE,
+            callbacks=self.create_callbacks('finetune'),
+            verbose=1
+        )
+        
+        return self.history['finetune']
+    
+    def plot_training_history(self):
+        """Visualize training progress"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Combine histories
+        all_loss = []
+        all_val_loss = []
+        all_mae = []
+        all_val_mae = []
+        
+        for stage_name, hist in self.history.items():
+            if hist is not None:
+                all_loss.extend(hist.history['loss'])
+                all_val_loss.extend(hist.history['val_loss'])
+                all_mae.extend(hist.history['mae'])
+                all_val_mae.extend(hist.history['val_mae'])
+        
+        epochs = range(1, len(all_loss) + 1)
+        
+        # Loss
+        axes[0, 0].plot(epochs, all_loss, 'b-', label='Training Loss')
+        axes[0, 0].plot(epochs, all_val_loss, 'r-', label='Validation Loss')
+        axes[0, 0].set_title('Model Loss (Huber)', fontsize=14, fontweight='bold')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # MAE
+        axes[0, 1].plot(epochs, all_mae, 'b-', label='Training MAE')
+        axes[0, 1].plot(epochs, all_val_mae, 'r-', label='Validation MAE')
+        axes[0, 1].set_title('Mean Absolute Error', fontsize=14, fontweight='bold')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('MAE (Normalized)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Loss - log scale
+        axes[1, 0].semilogy(epochs, all_loss, 'b-', label='Training Loss')
+        axes[1, 0].semilogy(epochs, all_val_loss, 'r-', label='Validation Loss')
+        axes[1, 0].set_title('Model Loss (Log Scale)', fontsize=14, fontweight='bold')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Loss (log)')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Learning rate (if available)
+        if 'lr' in self.history.get('finetune', {}).history:
+            all_lr = self.history['finetune'].history['lr']
+            axes[1, 1].plot(range(1, len(all_lr) + 1), all_lr, 'g-')
+            axes[1, 1].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].set_ylabel('Learning Rate')
+            axes[1, 1].set_yscale('log')
+            axes[1, 1].grid(True, alpha=0.3)
+        else:
+            axes[1, 1].text(0.5, 0.5, 'Learning Rate\nHistory\nNot Available',
+                           ha='center', va='center', fontsize=14)
+            axes[1, 1].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        print(f"\nFinal Training MAE: {all_mae[-1]:.4f}")
+        print(f"Final Validation MAE: {all_val_mae[-1]:.4f}")
+
+
+# ============================================================================
+# 6. EVALUATION
+# ============================================================================
+
+class Evaluator:
+    """Model evaluation and visualization"""
+    
+    def __init__(self, model, pipeline: DataPipeline):
+        self.model = model
+        self.pipeline = pipeline
+        
+    def evaluate_dataset(self, dataset, true_prices, name='Test'):
+        """Evaluate model on a dataset"""
+        print(f"\nEvaluating on {name} set...")
+        
+        # Get predictions
+        predictions = self.model.predict(dataset, verbose=1)
+        predictions = predictions.flatten()
+        
+        # Denormalize
+        pred_prices = self.pipeline.denormalize_price(predictions)
+        true_prices_orig = true_prices
+        
+        # Compute metrics
+        mae = mean_absolute_error(true_prices_orig, pred_prices)
+        rmse = np.sqrt(mean_squared_error(true_prices_orig, pred_prices))
+        median_ae = np.median(np.abs(true_prices_orig - pred_prices))
+        mape = np.mean(np.abs((true_prices_orig - pred_prices) / (true_prices_orig + 1e-8))) * 100
+        
+        print(f"\n{name} Set Metrics:")
+        print(f"  MAE:  {mae:.2f}")
+        print(f"  RMSE: {rmse:.2f}")
+        print(f"  Median AE: {median_ae:.2f}")
+        print(f"  MAPE: {mape:.2f}%")
+        
+        return pred_prices, {
+            'mae': mae,
+            'rmse': rmse,
+            'median_ae': median_ae,
+            'mape': mape
+        }
+    
+    def plot_predictions(self, true_prices, pred_prices, sample_size=1000):
+        """Visualize predictions vs true prices"""
+        
+        # Sample for visualization
+        if len(true_prices) > sample_size:
+            indices = np.random.choice(len(true_prices), sample_size, replace=False)
+            true_sample = true_prices[indices]
+            pred_sample = pred_prices[indices]
+        else:
+            true_sample = true_prices
+            pred_sample = pred_prices
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # Scatter plot
+        axes[0, 0].scatter(true_sample, pred_sample, alpha=0.5, s=10)
+        axes[0, 0].plot([true_sample.min(), true_sample.max()], 
+                        [true_sample.min(), true_sample.max()], 
+                        'r--', lw=2, label='Perfect Prediction')
+        axes[0, 0].set_xlabel('True Price', fontsize=12)
+        axes[0, 0].set_ylabel('Predicted Price', fontsize=12)
+        axes[0, 0].set_title('Predicted vs True Prices', fontsize=14, fontweight='bold')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Residuals
+        residuals = pred_sample - true_sample
+        axes[0, 1].scatter(true_sample, residuals, alpha=0.5, s=10)
+        axes[0, 1].axhline(y=0, color='r', linestyle='--', lw=2)
+        axes[0, 1].set_xlabel('True Price', fontsize=12)
+        axes[0, 1].set_ylabel('Residual (Pred - True)', fontsize=12)
+        axes[0, 1].set_title('Residual Plot', fontsize=14, fontweight='bold')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Error distribution
+        errors = np.abs(residuals)
+        axes[1, 0].hist(errors, bins=50, edgecolor='black', alpha=0.7)
+        axes[1, 0].set_xlabel('Absolute Error', fontsize=12)
+        axes[1, 0].set_ylabel('Frequency', fontsize=12)
+        axes[1, 0].set_title('Error Distribution', fontsize=14, fontweight='bold')
+        axes[1, 0].axvline(np.median(errors), color='r', linestyle='--', 
+                          lw=2, label=f'Median: {np.median(errors):.2f}')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3, axis='y')
+        
+        # Percentage error distribution
+        pct_errors = np.abs((pred_sample - true_sample) / (true_sample + 1e-8)) * 100
+        pct_errors = pct_errors[pct_errors < 200]  # Remove extreme outliers
+        axes[1, 1].hist(pct_errors, bins=50, edgecolor='black', alpha=0.7)
+        axes[1, 1].set_xlabel('Absolute Percentage Error (%)', fontsize=12)
+        axes[1, 1].set_ylabel('Frequency', fontsize=12)
+        axes[1, 1].set_title('Percentage Error Distribution', fontsize=14, fontweight='bold')
+        axes[1, 1].axvline(np.median(pct_errors), color='r', linestyle='--', 
+                          lw=2, label=f'Median: {np.median(pct_errors):.2f}%')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3, axis='y')
+        
+        plt.tight_layout()
+        plt.savefig('prediction_analysis.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+
+# ============================================================================
+# 7. PSEUDO-LABELING FOR SEMI-SUPERVISED LEARNING
+# ============================================================================
+
+class PseudoLabeler:
+    """Generate pseudo-labels for unlabeled/noisy data"""
+    
+    def __init__(self, model, pipeline: DataPipeline, config: Config):
+        self.model = model
+        self.pipeline = pipeline
+        self.config = config
+    
+    def generate_pseudo_labels(self, unlabeled_df: pd.DataFrame):
+        """Generate pseudo-labels with confidence scores"""
+        print("\nGenerating pseudo-labels...")
+        
+        # Create dataset
+        temp_ds = self.pipeline.create_dataset(
+            unlabeled_df, 
+            is_training=False, 
+            shuffle=False
+        )
+        
+        # Get predictions
+        predictions = self.model.predict(temp_ds, verbose=1)
+        predictions = predictions.flatten()
+        
+        # Denormalize
+        pseudo_prices = self.pipeline.denormalize_price(predictions)
+        
+        # Add to dataframe
+        unlabeled_df['pseudo_price'] = pseudo_prices
+        unlabeled_df['has_pseudo_label'] = True
+        
+        print(f"Generated {len(pseudo_prices)} pseudo-labels")
+        
+        return unlabeled_df
+
+
+# ============================================================================
+# 8. CLIP-BASED ALTERNATIVE (OPTIONAL)
+# ============================================================================
+
+"""
+CLIP-Based Approach (Optional - requires PyTorch)
+
+This section provides an alternative using CLIP embeddings.
+Uncomment and adapt if you want to try CLIP + XGBoost/MLP.
+
+# !pip install torch torchvision clip-by-openai xgboost
+
+import torch
+import clip
+from PIL import Image
+import xgboost as xgb
+
+class CLIPEmbedder:
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.device = device
+        self.model, self.preprocess = clip.load('ViT-B/32', device=device)
+        
+    def extract_embeddings(self, image_paths, batch_size=32):
+        embeddings = []
+        
+        for i in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[i:i+batch_size]
+            batch_images = []
+            
+            for path in batch_paths:
+                image = Image.open(path).convert('RGB')
+                image = self.preprocess(image).unsqueeze(0).to(self.device)
+                batch_images.append(image)
+            
+            batch_tensor = torch.cat(batch_images)
+            
+            with torch.no_grad():
+                features = self.model.encode_image(batch_tensor)
+                features = features.cpu().numpy()
+                embeddings.append(features)
+        
+        return np.vstack(embeddings)
+
+# Usage:
+# embedder = CLIPEmbedder()
+# train_embeddings = embedder.extract_embeddings(train_df['full_path'].values)
+# 
+# # Train XGBoost
+# xgb_model = xgb.XGBRegressor(n_estimators=1000, learning_rate=0.05, max_depth=8)
+# xgb_model.fit(train_embeddings, train_df['price'].values)
+"""
+
+
+# ============================================================================
+# 9. MAIN EXECUTION PIPELINE
+# ============================================================================
+
+def main():
+    """Main training and evaluation pipeline"""
+    
+    print("="*70)
+    print("LARGE-SCALE IMAGE-TO-PRICE REGRESSION PIPELINE")
+    print("="*70)
+    
+    # -------------------------------------------------------------------------
+    # Load Data
+    # -------------------------------------------------------------------------
+    print("\n[1/6] Loading data...")
+    data_loader = DataLoader(config)
+    train_df = data_loader.load_csv(config.TRAIN_CSV, is_train=True)
+    test_df = data_loader.load_csv(config.TEST_CSV, is_train=True)
+    
+    # Split train into train/val
+    val_size = int(0.1 * len(train_df))
+    train_df_split = train_df.iloc[val_size:].reset_index(drop=True)
+    val_df = train_df.iloc[:val_size].reset_index(drop=True)
+    
+    print(f"\nDataset splits:")
+    print(f"  Training:   {len(train_df_split):,} samples")
+    print(f"  Validation: {len(val_df):,} samples")
+    print(f"  Test:       {len(test_df):,} samples")
+    
+    # Get statistics
+    price_stats = data_loader.get_dataset_stats(train_df)
+    print(f"\nPrice statistics (training set):")
+    for k, v in price_stats.items():
+        print(f"  {k}: {v:.2f}" if isinstance(v, float) else f"  {k}: {v}")
+    
+    # -------------------------------------------------------------------------
+    # Create Data Pipelines
+    # -------------------------------------------------------------------------
+    print("\n[2/6] Creating data pipelines...")
+    pipeline = DataPipeline(config, price_stats)
+    
+    train_ds = pipeline.create_dataset(train_df_split, is_training=True, shuffle=True)
+    val_ds = pipeline.create_dataset(val_df, is_training=False, shuffle=False)
+    test_ds = pipeline.create_dataset(test_df, is_training=False, shuffle=False)
+    
+    print("Data pipelines created successfully!")
+    
+    # -------------------------------------------------------------------------
+    # Build Model
+    # -------------------------------------------------------------------------
+    print("\n[3/6] Building model...")
+    model_builder = PriceRegressionModel(config)
+    
+    # -------------------------------------------------------------------------
+    # Training
+    # -------------------------------------------------------------------------
+    print("\n[4/6] Training model...")
+    trainer = Trainer(config, model_builder)
+    
+    # Stage 1: Frozen backbone
+    hist_frozen = trainer.train_frozen(train_ds, val_ds)
+    
+    # Stage 2: Fine-tuning
+    hist_finetune = trainer.train_finetune(train_ds, val_ds)
+    
+    # Plot training history
+    trainer.plot_training_history()
+    
+    # -------------------------------------------------------------------------
+    # Evaluation
+    # -------------------------------------------------------------------------
+    print("\n[5/6] Evaluating model...")
+    evaluator = Evaluator(trainer.model, pipeline)
+    
+    # Evaluate on validation set
+    val_preds, val_metrics = evaluator.evaluate_dataset(
+        val_ds, 
+        val_df['price'].values,
+        name='Validation'
+    )
+    
+    # Evaluate on test set
+    test_preds, test_metrics = evaluator.evaluate_dataset(
+        test_ds,
+        test_df['price'].values,
+        name='Test'
+    )
+    
+    # Visualize predictions
+    evaluator.plot_predictions(test_df['price'].values, test_preds, sample_size=1000)
+    
+    # -------------------------------------------------------------------------
+    # Save Results
+    # -------------------------------------------------------------------------
+    print("\n[6/6] Saving results...")
+    
+    # Save model
+    final_model_path = os.path.join(config.CHECKPOINT_DIR, 'final_model.h5')
+    trainer.model.save(final_model_path)
+    print(f"Model saved to: {final_model_path}")
+    
+    # Save predictions
+    test_df['predicted_price'] = test_preds
+    test_df[['id', 'price', 'predicted_price']].to_csv('test_predictions.csv', index=False)
+    print("Test predictions saved to: test_predictions.csv")
+    
+    # Save metrics
+    metrics_summary = {
+        'validation': val_metrics,
+        'test': test_metrics,
+        'config': {
+            'backbone': config.BACKBONE,
+            'batch_size': config.BATCH_SIZE,
+            'img_size': config.IMG_SIZE,
+            'learning_rate': config.LEARNING_RATE,
+            'finetune_lr': config.FINETUNE_LR,
+        }
+    }
+    
+    with open('metrics_summary.json', 'w') as f:
+        json.dump(metrics_summary, f, indent=2)
+    print("Metrics saved to: metrics_summary.json")
+    
+    print("\n" + "="*70)
+    print("PIPELINE COMPLETED SUCCESSFULLY!")
+    print("="*70)
+    print(f"\nTest Set Performance:")
+    print(f"  MAE:  {test_metrics['mae']:.2f}")
+    print(f"  RMSE: {test_metrics['rmse']:.2f}")
+    print(f"  Median AE: {test_metrics['median_ae']:.2f}")
+    print(f"  MAPE: {test_metrics['mape']:.2f}%")
+    
+    return trainer.model, test_preds, metrics_summary
+
+
+# ============================================================================
+# 10. UTILITY FUNCTIONS
+# ============================================================================
+
+def visualize_sample_predictions(model, test_df, pipeline, num_samples=6):
+    """Visualize predictions on random sample images"""
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    
+    # Sample random images
+    sample_df = test_df.sample(num_samples).reset_index(drop=True)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
+    
+    for idx, (_, row) in enumerate(sample_df.iterrows()):
+        # Load and display image
+        img = Image.open(row['full_path']).convert('RGB')
+        axes[idx].imshow(img)
+        
+        # Get prediction
+        img_array = tf.keras.preprocessing.image.img_to_array(img)
+        img_array = tf.image.resize(img_array, [config.IMG_SIZE, config.IMG_SIZE])
+        img_array = img_array / 255.0
+        img_array = tf.expand_dims(img_array, 0)
+        
+        pred_normalized = model.predict(img_array, verbose=0)[0][0]
+        pred_price = pipeline.denormalize_price(pred_normalized)
+        true_price = row['price']
+        
+        error = abs(pred_price - true_price)
+        error_pct = (error / true_price) * 100
+        
+        # Title with prediction info
+        title = f"True: ${true_price:.2f}\nPred: ${pred_price:.2f}\nError: {error_pct:.1f}%"
+        axes[idx].set_title(title, fontsize=10)
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('sample_predictions.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def analyze_error_by_price_range(test_df, pred_prices):
+    """Analyze prediction errors across different price ranges"""
+    import matplotlib.pyplot as plt
+    
+    test_df['predicted_price'] = pred_prices
+    test_df['error'] = abs(test_df['predicted_price'] - test_df['price'])
+    test_df['error_pct'] = (test_df['error'] / test_df['price']) * 100
+    
+    # Define price bins
+    bins = [0, 50, 100, 200, 500, 1000, float('inf')]
+    labels = ['$0-50', '$50-100', '$100-200', '$200-500', '$500-1000', '$1000+']
+    test_df['price_bin'] = pd.cut(test_df['price'], bins=bins, labels=labels)
+    
+    # Calculate metrics per bin
+    bin_stats = test_df.groupby('price_bin').agg({
+        'error': ['mean', 'median'],
+        'error_pct': ['mean', 'median'],
+        'id': 'count'
+    }).round(2)
+    
+    print("\nError Analysis by Price Range:")
+    print(bin_stats)
+    
+    # Visualize
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # MAE by price range
+    bin_mae = test_df.groupby('price_bin')['error'].mean()
+    axes[0].bar(range(len(bin_mae)), bin_mae.values, color='steelblue', alpha=0.7)
+    axes[0].set_xticks(range(len(bin_mae)))
+    axes[0].set_xticklabels(bin_mae.index, rotation=45)
+    axes[0].set_xlabel('Price Range')
+    axes[0].set_ylabel('Mean Absolute Error ($)')
+    axes[0].set_title('MAE by Price Range', fontsize=14, fontweight='bold')
+    axes[0].grid(True, alpha=0.3, axis='y')
+    
+    # MAPE by price range
+    bin_mape = test_df.groupby('price_bin')['error_pct'].mean()
+    axes[1].bar(range(len(bin_mape)), bin_mape.values, color='coral', alpha=0.7)
+    axes[1].set_xticks(range(len(bin_mape)))
+    axes[1].set_xticklabels(bin_mape.index, rotation=45)
+    axes[1].set_xlabel('Price Range')
+    axes[1].set_ylabel('Mean Absolute Percentage Error (%)')
+    axes[1].set_title('MAPE by Price Range', fontsize=14, fontweight='bold')
+    axes[1].grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig('error_by_price_range.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def create_submission_file(model, test_df, pipeline, output_path='submission.csv'):
+    """Create submission file for competitions"""
+    print("\nCreating submission file...")
+    
+    # Create dataset
+    test_ds = pipeline.create_dataset(test_df, is_training=False, shuffle=False)
+    
+    # Get predictions
+    predictions = model.predict(test_ds, verbose=1)
+    predictions = predictions.flatten()
+    pred_prices = pipeline.denormalize_price(predictions)
+    
+    # Create submission
+    submission = pd.DataFrame({
+        'id': test_df['id'],
+        'price': pred_prices
+    })
+    
+    submission.to_csv(output_path, index=False)
+    print(f"Submission saved to: {output_path}")
+    print(f"Total predictions: {len(submission)}")
+    
+    return submission
+
+
+# ============================================================================
+# 11. ADVANCED: PRECOMPUTE EMBEDDINGS FOR FASTER TRAINING
+# ============================================================================
+
+class EmbeddingExtractor:
+    """Extract and cache embeddings from pretrained models"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        
+    def extract_embeddings(self, df: pd.DataFrame, model_builder: PriceRegressionModel):
+        """Extract embeddings using the backbone model"""
+        print("\nExtracting embeddings...")
+        
+        # Build model without regression head
+        inputs = layers.Input(shape=self.config.IMG_SHAPE)
+        
+        if 'efficientnet' in self.config.BACKBONE:
+            if self.config.BACKBONE == 'efficientnetv2-b0':
+                backbone = keras.applications.EfficientNetV2B0(
+                    include_top=False, weights='imagenet', input_tensor=inputs, pooling='avg'
+                )
+            elif self.config.BACKBONE == 'efficientnetv2-b1':
+                backbone = keras.applications.EfficientNetV2B1(
+                    include_top=False, weights='imagenet', input_tensor=inputs, pooling='avg'
+                )
+            else:
+                backbone = keras.applications.EfficientNetV2B2(
+                    include_top=False, weights='imagenet', input_tensor=inputs, pooling='avg'
+                )
+        
+        embedding_model = models.Model(inputs=inputs, outputs=backbone.output)
+        
+        # Create dataset
+        pipeline = DataPipeline(self.config, {'price_mean': 0, 'price_std': 1})
+        dataset = pipeline.create_dataset(df, is_training=False, shuffle=False)
+        
+        # Extract embeddings
+        embeddings = embedding_model.predict(dataset, verbose=1)
+        
+        return embeddings
+    
+    def save_embeddings(self, embeddings, prices, filename):
+        """Save embeddings to disk"""
+        save_path = os.path.join(self.config.EMBEDDINGS_DIR, filename)
+        np.savez_compressed(save_path, embeddings=embeddings, prices=prices)
+        print(f"Embeddings saved to: {save_path}")
+    
+    def load_embeddings(self, filename):
+        """Load embeddings from disk"""
+        load_path = os.path.join(self.config.EMBEDDINGS_DIR, filename)
+        data = np.load(load_path)
+        return data['embeddings'], data['prices']
+
+
+def train_on_embeddings(train_embeddings, train_prices, val_embeddings, val_prices, config):
+    """Train a simple MLP on precomputed embeddings"""
+    print("\nTraining MLP on embeddings...")
+    
+    # Normalize prices
+    price_mean = train_prices.mean()
+    price_std = train_prices.std()
+    train_prices_norm = (train_prices - price_mean) / (price_std + 1e-8)
+    val_prices_norm = (val_prices - price_mean) / (price_std + 1e-8)
+    
+    # Build MLP
+    model = keras.Sequential([
+        layers.Input(shape=(train_embeddings.shape[1],)),
+        layers.Dense(512, activation='relu', kernel_regularizer=keras.regularizers.l2(config.L2_REG)),
+        layers.Dropout(config.DROPOUT_RATE),
+        layers.Dense(256, activation='relu', kernel_regularizer=keras.regularizers.l2(config.L2_REG)),
+        layers.Dropout(config.DROPOUT_RATE),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(1)
+    ])
+    
+    model.compile(
+        optimizer=keras.optimizers.Adam(config.LEARNING_RATE),
+        loss=huber_loss,
+        metrics=['mae', 'mse']
+    )
+    
+    # Train
+    history = model.fit(
+        train_embeddings, train_prices_norm,
+        validation_data=(val_embeddings, val_prices_norm),
+        epochs=50,
+        batch_size=256,
+        callbacks=[
+            callbacks.EarlyStopping(patience=10, restore_best_weights=True),
+            callbacks.ReduceLROnPlateau(patience=5, factor=0.5)
+        ],
+        verbose=1
+    )
+    
+    return model, history
+
+
+# ============================================================================
+# 12. EXECUTION
+# ============================================================================
+
+if __name__ == '__main__':
+    """
+    To run this pipeline:
+    
+    1. Replace the paths in Config class with your actual data paths
+    2. Ensure your CSV files have columns: id, image_path, price
+    3. Run: python image_price_regression.py
+    
+    For Google Colab:
+    - Uncomment the !pip install lines at the top
+    - Upload your data or mount Google Drive
+    - Run all cells
+    """
+    
+    # Run main pipeline
+    model, predictions, metrics = main()
+    
+    # Optional: Run additional analyses
+    print("\n" + "="*70)
+    print("ADDITIONAL ANALYSES")
+    print("="*70)
+    
+    # Load test data for visualization
+    test_df = pd.read_csv(config.TEST_CSV)
+    test_df['full_path'] = test_df['image_path'].apply(
+        lambda x: os.path.join(config.IMAGE_DIR, x)
+    )
+    
+    # Visualize sample predictions
+    print("\nGenerating sample visualizations...")
+    visualize_sample_predictions(model, test_df, pipeline, num_samples=6)
+    
+    # Analyze errors by price range
+    print("\nAnalyzing errors by price range...")
+    analyze_error_by_price_range(test_df, predictions)
+    
+    # Create submission file (if needed for competition)
+    # create_submission_file(model, test_df, pipeline)
+    
+    print("\n" + "="*70)
+    print("ALL ANALYSES COMPLETED!")
+    print("="*70)
+    
+    """
+    NEXT STEPS & IMPROVEMENTS:
+    
+    1. Hyperparameter Tuning:
+       - Try different backbones (EfficientNetV2-B3, ViT-B/16)
+       - Experiment with learning rates and batch sizes
+       - Adjust dropout rates and regularization
+    
+    2. Advanced Techniques:
+       - Implement pseudo-labeling for semi-supervised learning
+       - Use test-time augmentation (TTA) for inference
+       - Ensemble multiple models for better predictions
+    
+    3. Data Quality:
+       - Remove or downweight noisy labels using confidence scores
+       - Augment with additional data sources
+       - Use active learning to label uncertain samples
+    
+    4. Model Optimization:
+       - Precompute embeddings for faster experimentation
+       - Use knowledge distillation to create smaller models
+       - Implement gradient accumulation for larger effective batch sizes
+    
+    5. Production Deployment:
+       - Convert model to TFLite for mobile/edge deployment
+       - Set up model serving with TensorFlow Serving
+       - Implement monitoring and retraining pipelines
+    """
