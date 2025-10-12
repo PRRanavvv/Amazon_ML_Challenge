@@ -55,7 +55,7 @@ CONFIG = {
     'model2_l2_reg': 1e-4,
     
     'use_text_features': True,
-    'use_ocr_features': True,  # NEW: Enable OCR
+    'use_ocr_features': False,  # NEW: Enable OCR
     'use_augmentation': True,
     
     # OCR Configuration
@@ -745,12 +745,19 @@ def inference_ensemble(models, test_embeddings, df_test, price_min, price_max):
     
     ensemble_pred = np.clip(ensemble_pred, price_min, price_max)
     
-    df_test['predicted_price'] = ensemble_pred
+    # Create output DataFrame with correct column names
+    output_df = pd.DataFrame({
+        'sample_id': df_test['sample_id'],
+        'price': ensemble_pred
+    })
     
-    output_path = './predictions.csv'
-    df_test[['sample_id', 'predicted_price']].to_csv(output_path, index=False)
+    # Save to dataset directory
+    output_path = os.path.join(CONFIG['data_dir'], 'predictions.csv')
+    output_df.to_csv(output_path, index=False)
+    
     print(f"✓ Saved to {output_path}")
     print(f"  Ensemble range: [{ensemble_pred.min():.2f}, {ensemble_pred.max():.2f}]")
+    print(f"  Output format: sample_id, price")
     
     return df_test
 
