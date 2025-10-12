@@ -90,155 +90,155 @@ os.makedirs(CONFIG['embeddings_dir'], exist_ok=True)
 # OCR SETUP AND EXTRACTION
 # ============================================================================
 
-def setup_ocr():
-    """Setup OCR engine based on configuration."""
-    print(f"\n{'='*70}")
-    print(f"Setting up OCR Engine: {CONFIG['ocr_backend']}")
-    print(f"{'='*70}")
+# def setup_ocr():
+#     """Setup OCR engine based on configuration."""
+#     print(f"\n{'='*70}")
+#     print(f"Setting up OCR Engine: {CONFIG['ocr_backend']}")
+#     print(f"{'='*70}")
     
-    if CONFIG['ocr_backend'] == 'easyocr':
-        try:
-            import easyocr
-            reader = easyocr.Reader(CONFIG['ocr_languages'], gpu=True)
-            print(f"  ✓ EasyOCR initialized with languages: {CONFIG['ocr_languages']}")
-            return reader, 'easyocr'
-        except ImportError:
-            print("  Installing EasyOCR (this may take a few minutes)...")
-            import subprocess
-            import sys
-            try:
-                # Try with verbose output to see what's happening
-                print("  Installing dependencies...")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-                print("  Installing easyocr...")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "easyocr"])
-                print("  ✓ Installation complete. Initializing...")
-                import easyocr
-                reader = easyocr.Reader(CONFIG['ocr_languages'], gpu=True)
-                print(f"  ✓ EasyOCR initialized with languages: {CONFIG['ocr_languages']}")
-                return reader, 'easyocr'
-            except Exception as install_error:
-                print(f"  ✗ EasyOCR installation failed: {install_error}")
-                print(f"  Falling back to Pytesseract...")
-                CONFIG['ocr_backend'] = 'pytesseract'
-                return setup_ocr()
-        except Exception as e:
-            print(f"  Error initializing EasyOCR: {e}")
-            print(f"  Falling back to Pytesseract...")
-            CONFIG['ocr_backend'] = 'pytesseract'
-            return setup_ocr()
+#     if CONFIG['ocr_backend'] == 'easyocr':
+#         try:
+#             import easyocr
+#             reader = easyocr.Reader(CONFIG['ocr_languages'], gpu=True)
+#             print(f"  ✓ EasyOCR initialized with languages: {CONFIG['ocr_languages']}")
+#             return reader, 'easyocr'
+#         except ImportError:
+#             print("  Installing EasyOCR (this may take a few minutes)...")
+#             import subprocess
+#             import sys
+#             try:
+#                 # Try with verbose output to see what's happening
+#                 print("  Installing dependencies...")
+#                 subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+#                 print("  Installing easyocr...")
+#                 subprocess.check_call([sys.executable, "-m", "pip", "install", "easyocr"])
+#                 print("  ✓ Installation complete. Initializing...")
+#                 import easyocr
+#                 reader = easyocr.Reader(CONFIG['ocr_languages'], gpu=True)
+#                 print(f"  ✓ EasyOCR initialized with languages: {CONFIG['ocr_languages']}")
+#                 return reader, 'easyocr'
+#             except Exception as install_error:
+#                 print(f"  ✗ EasyOCR installation failed: {install_error}")
+#                 print(f"  Falling back to Pytesseract...")
+#                 CONFIG['ocr_backend'] = 'pytesseract'
+#                 return setup_ocr()
+#         except Exception as e:
+#             print(f"  Error initializing EasyOCR: {e}")
+#             print(f"  Falling back to Pytesseract...")
+#             CONFIG['ocr_backend'] = 'pytesseract'
+#             return setup_ocr()
     
-    elif CONFIG['ocr_backend'] == 'pytesseract':
-        try:
-            import pytesseract
-            from PIL import Image
-            # Test if pytesseract is properly configured
-            pytesseract.get_tesseract_version()
-            print(f"  ✓ Pytesseract initialized")
-            return None, 'pytesseract'
-        except ImportError:
-            print("  Installing pytesseract...")
-            import subprocess
-            import sys
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "pytesseract"])
-                import pytesseract
-                print(f"  ✓ Pytesseract installed")
-                return None, 'pytesseract'
-            except Exception as e:
-                print(f"  Error installing pytesseract: {e}")
-                CONFIG['use_ocr_features'] = False
-                return None, None
-        except Exception as e:
-            print(f"  Warning: Tesseract binary not found.")
-            print(f"  Install from: https://github.com/tesseract-ocr/tesseract")
-            print(f"  Disabling OCR features and continuing without OCR...")
-            CONFIG['use_ocr_features'] = False
-            return None, None
+#     elif CONFIG['ocr_backend'] == 'pytesseract':
+#         try:
+#             import pytesseract
+#             from PIL import Image
+#             # Test if pytesseract is properly configured
+#             pytesseract.get_tesseract_version()
+#             print(f"  ✓ Pytesseract initialized")
+#             return None, 'pytesseract'
+#         except ImportError:
+#             print("  Installing pytesseract...")
+#             import subprocess
+#             import sys
+#             try:
+#                 subprocess.check_call([sys.executable, "-m", "pip", "install", "pytesseract"])
+#                 import pytesseract
+#                 print(f"  ✓ Pytesseract installed")
+#                 return None, 'pytesseract'
+#             except Exception as e:
+#                 print(f"  Error installing pytesseract: {e}")
+#                 CONFIG['use_ocr_features'] = False
+#                 return None, None
+#         except Exception as e:
+#             print(f"  Warning: Tesseract binary not found.")
+#             print(f"  Install from: https://github.com/tesseract-ocr/tesseract")
+#             print(f"  Disabling OCR features and continuing without OCR...")
+#             CONFIG['use_ocr_features'] = False
+#             return None, None
     
-    return None, None
+#     return None, None
 
-def extract_text_from_image(img_path, ocr_reader, ocr_backend):
-    """Extract text from image using OCR."""
-    try:
-        if ocr_backend == 'easyocr':
-            result = ocr_reader.readtext(img_path, detail=1)
-            # Filter by confidence
-            texts = [text for bbox, text, conf in result 
-                    if conf >= CONFIG['ocr_confidence_threshold']]
-            return ' '.join(texts)
+# def extract_text_from_image(img_path, ocr_reader, ocr_backend):
+#     """Extract text from image using OCR."""
+#     try:
+#         if ocr_backend == 'easyocr':
+#             result = ocr_reader.readtext(img_path, detail=1)
+#             # Filter by confidence
+#             texts = [text for bbox, text, conf in result 
+#                     if conf >= CONFIG['ocr_confidence_threshold']]
+#             return ' '.join(texts)
         
-        elif ocr_backend == 'pytesseract':
-            import pytesseract
-            img = Image.open(img_path)
-            text = pytesseract.image_to_string(img)
-            return text.strip()
+#         elif ocr_backend == 'pytesseract':
+#             import pytesseract
+#             img = Image.open(img_path)
+#             text = pytesseract.image_to_string(img)
+#             return text.strip()
         
-    except Exception as e:
-        # Silently fail for individual images
-        return ""
+#     except Exception as e:
+#         # Silently fail for individual images
+#         return ""
     
-    return ""
+#     return ""
 
 
-def precompute_ocr_features(df, image_folder, available_images, output_path, ocr_reader, ocr_backend):
-    """Extract OCR text from all images and create embeddings."""
-    print(f"\n{'='*70}")
-    print(f"Extracting OCR features for {len(df)} samples")
-    print(f"{'='*70}")
+# def precompute_ocr_features(df, image_folder, available_images, output_path, ocr_reader, ocr_backend):
+#     """Extract OCR text from all images and create embeddings."""
+#     print(f"\n{'='*70}")
+#     print(f"Extracting OCR features for {len(df)} samples")
+#     print(f"{'='*70}")
     
-    # Build image paths
-    image_paths = {}
-    for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
-        for img_id in available_images:
-            path = os.path.join(image_folder, f"{img_id}{ext}")
-            if os.path.exists(path):
-                image_paths[img_id] = path
-                break
+#     # Build image paths
+#     image_paths = {}
+#     for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+#         for img_id in available_images:
+#             path = os.path.join(image_folder, f"{img_id}{ext}")
+#             if os.path.exists(path):
+#                 image_paths[img_id] = path
+#                 break
     
-    # Extract OCR text
-    ocr_texts = []
-    successful_ocr = 0
+#     # Extract OCR text
+#     ocr_texts = []
+#     successful_ocr = 0
     
-    for i, row in df.iterrows():
-        img_id = extract_image_id(row['image_link'])
+#     for i, row in df.iterrows():
+#         img_id = extract_image_id(row['image_link'])
         
-        if img_id in image_paths:
-            text = extract_text_from_image(image_paths[img_id], ocr_reader, ocr_backend)
-            if text:
-                successful_ocr += 1
-            ocr_texts.append(text if text else "no text detected")
-        else:
-            ocr_texts.append("no text detected")
+#         if img_id in image_paths:
+#             text = extract_text_from_image(image_paths[img_id], ocr_reader, ocr_backend)
+#             if text:
+#                 successful_ocr += 1
+#             ocr_texts.append(text if text else "no text detected")
+#         else:
+#             ocr_texts.append("no text detected")
         
-        if (i + 1) % 10 == 0:
-            print(f"  Processed {i+1}/{len(df)} images ({successful_ocr} with text)")
+#         if (i + 1) % 10 == 0:
+#             print(f"  Processed {i+1}/{len(df)} images ({successful_ocr} with text)")
     
-    print(f"  ✓ OCR successful on {successful_ocr}/{len(df)} images")
+#     print(f"  ✓ OCR successful on {successful_ocr}/{len(df)} images")
     
-    # Create embeddings from OCR text
-    try:
-        from sentence_transformers import SentenceTransformer
-    except ImportError:
-        print("  Installing sentence-transformers...")
-        os.system("pip install sentence-transformers -q")
-        from sentence_transformers import SentenceTransformer
+#     # Create embeddings from OCR text
+#     try:
+#         from sentence_transformers import SentenceTransformer
+#     except ImportError:
+#         print("  Installing sentence-transformers...")
+#         os.system("pip install sentence-transformers -q")
+#         from sentence_transformers import SentenceTransformer
     
-    print(f"  Creating embeddings from OCR text...")
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    ocr_embeddings = model.encode(ocr_texts, show_progress_bar=True, batch_size=32)
+#     print(f"  Creating embeddings from OCR text...")
+#     model = SentenceTransformer('all-MiniLM-L6-v2')
+#     ocr_embeddings = model.encode(ocr_texts, show_progress_bar=True, batch_size=32)
     
-    np.save(output_path, ocr_embeddings)
-    print(f"  ✓ Saved OCR embeddings: {ocr_embeddings.shape}")
+#     np.save(output_path, ocr_embeddings)
+#     print(f"  ✓ Saved OCR embeddings: {ocr_embeddings.shape}")
     
-    # Save raw OCR text for inspection
-    ocr_text_path = output_path.replace('.npy', '_raw.txt')
-    with open(ocr_text_path, 'w', encoding='utf-8') as f:
-        for i, text in enumerate(ocr_texts):
-            f.write(f"Image {i}: {text}\n")
-    print(f"  ✓ Saved raw OCR text to: {ocr_text_path}")
+#     # Save raw OCR text for inspection
+#     ocr_text_path = output_path.replace('.npy', '_raw.txt')
+#     with open(ocr_text_path, 'w', encoding='utf-8') as f:
+#         for i, text in enumerate(ocr_texts):
+#             f.write(f"Image {i}: {text}\n")
+#     print(f"  ✓ Saved raw OCR text to: {ocr_text_path}")
     
-    return ocr_embeddings
+#     return ocr_embeddings
 
 
 # ============================================================================
