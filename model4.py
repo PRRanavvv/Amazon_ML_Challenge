@@ -19,73 +19,78 @@ warnings.filterwarnings('ignore')
 # CONFIGURATION
 # ============================================================================
 
-CONFIG = {
-    # Paths
-    'data_dir': r'C:\Users\rawat\Downloads\ml challenge\student_resource\dataset',
-    'csv_train': r'C:\Users\rawat\Downloads\ml challenge\student_resource\dataset\train.csv',
-    'csv_test': r'C:\Users\rawat\Downloads\ml challenge\student_resource\dataset\test.csv',
-    'embeddings_dir': './embeddings',
-    
-    # Sample limits
-    'max_train_samples': 75,
-    'max_test_samples': 10,
-     
+# Windows-Optimized Configuration for 150K Samples on RTX 4050 GPU
 
-    'use_structured_catalog_features': True,  # NEW
-    'use_catalog_embeddings': True,
-    
-    # Model config - IMPROVED
-    'image_size': 224,
-    'batch_size_precompute': 8,
-    'batch_size_train': 16,
+CONFIG = {
+    # Paths (Windows-friendly)
+    'data_dir': r'C:\Users\rawat\Downloads\ml_challenge\student_resource\dataset',
+    'csv_train': r'C:\Users\rawat\Downloads\ml_challenge\student_resource\dataset\train.csv',
+    'csv_test': r'C:\Users\rawat\Downloads\ml_challenge\student_resource\dataset\test.csv',
+    'embeddings_dir': r'.\embeddings',
+
+    # Dataset
+    'max_train_samples': 75000,
+    'max_test_samples': 75000,
+
+    # Embedding Model (faster base CLIP)
+    'clip_model': 'openai/clip-vit-base-patch32',
     'embedding_dim': 512,
     'text_embedding_dim': 384,
-    
-    # Ensemble configuration
-    'use_ensemble': True,
-    'ensemble_weights': [0.5, 0.5],  # Equal weights for both models
-    
-    # Model 1: Deep MLP with BatchNorm
-    'model1_hidden_dims': [256, 128, 64],
-    'model1_dropout': 0.4,
-    'model1_use_batch_norm': True,
-    'model1_use_residual': True,
-    
-    # Model 2: Wide MLP with L2 Regularization
-    'model2_hidden_dims': [512, 256, 128],
-    'model2_dropout': 0.3,
-    'model2_use_batch_norm': True,
-    'model2_use_residual': False,
-    'model2_l2_reg': 1e-4,
-    
+
+    # Feature Toggles
     'use_text_features': True,
-    'use_ocr_features': False,  # NEW: Enable OCR
-    'use_augmentation': True,
-    
-    # OCR Configuration
-    'ocr_backend': 'easyocr',  # Options: 'easyocr', 'pytesseract'
-    'ocr_languages': ['en'],
-    'ocr_confidence_threshold': 0.3,
-    
-    # Training - IMPROVED WITH BATCH NORM & LR SCHEDULING
-    'epochs': 100,
-    'learning_rate': 5e-4,
-    'batch_norm_momentum': 0.99,
-    'batch_norm_epsilon': 1e-3,
-    'patience': 15,
+    'use_structured_catalog_features': True,
+    'use_ocr_features': False,
+
+    # Data Augmentation
+    'use_augmentation': False,          # disable for throughput
+
+    # Batch Sizes (maximize GPU utilization)
+    'batch_size_precompute': 128,       # large for GPU
+    'batch_size_train': 256,
+
+    # Ensemble / Model Architecture
+    'use_ensemble': False,              # single model
+    'model_architecture': 'wide_dropout_ensemble',
+    'model_hidden_dims': [1024, 512, 256],
+    'dropout_rates': [0.5, 0.4, 0.3],
+
+    # Training Hyperparameters
+    'epochs': 30,
+    'learning_rate': 5e-4,              # tuned for GPU stability
+    'patience': 6,                      # early stopping
     'loss_fn': 'huber',
     'log_transform_price': True,
     'price_clip_percentile': (2, 98),
-    
+
     # Learning Rate Scheduling
     'use_lr_decay': True,
-    'decay_steps': 100,
-    'decay_rate': 0.96,
+    'decay_steps': 200,
+    'decay_rate': 0.94,
     'use_reduce_lr_on_plateau': False,
-    'reduce_lr_factor': 0.5,
-    'reduce_lr_patience': 5,
-    'reduce_lr_min': 1e-6,
+
+    # GPU & Precision
+    'use_gpu': True,
+    'gpu_device': 'cuda:0',             # RTX 4050
+    'use_mixed_precision': True,
+    'mixed_precision_policy': 'cuda_amp',  # PyTorch AMP
+    'loss_scaling': 'dynamic',
+
+    # Performance Optimizations
+    'pin_memory': True,
+    'num_workers': 8,
+    'torch_compile': True,              # PyTorch 2.0 compile
+    'use_gradient_checkpointing': True,
+    'max_grad_norm': 1.0,
+    'clear_cache_frequency': 5000,
+
+    # Windows-Specific Tweaks
+    'enable_dataloader_prefetch': True,  # Windows benefit
+    'enable_overlapping_transfers': True,# overlap host->device transfers
+    'num_intraop_threads': 4,
+    'num_interop_threads': 4,
 }
+
 
 os.makedirs(CONFIG['embeddings_dir'], exist_ok=True)
 
