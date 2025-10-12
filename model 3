@@ -1,0 +1,804 @@
+#!/usr/bin/env python3
+"""
+ENHANCED: K-Fold Cross-Validation with Comprehensive Metrics & Domain Features
+Key improvements:
+- K-fold cross-validation for robust evaluation
+- Comprehensive metrics (RMSE, R², MAPE, bucket accuracy)
+- Domain-specific features extraction
+- Deeper MLP with 4-5 additional hidden layers
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from pathlib import Path
+from PIL import Image
+import warnings
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_percentage_error
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURATION - K-FOLD WITH ENHANCED FEATURES
+# ============================================================================
+
+CONFIG = {
+    'data_dir': r'C:\Users\rawat\Downloads\ml challenge\student_resource\dataset',
+    'csv_train': r'C:\Users\rawat\Downloads\ml challenge\student_resource\dataset\train.csv',
+    'csv_test': r'C:\Users\rawat\Downloads\ml challenge\student_resource\dataset\test.csv',
+    
+    'max_train_samples': 300,
+    'max_test_samples': 100,
+    
+    'embeddings_dir': './embeddings',
+    'embeddings_train_npy': './embeddings/train_embeddings.npy',
+    'embeddings_test_npy': './embeddings/test_embeddings.npy',
+    'text_embeddings_train': './embeddings/text_train_embeddings.npy',
+    'text_embeddings_test': './embeddings/text_test_embeddings.npy',
+    
+    # Model config
+    'image_size': 224,
+    'batch_size_precompute': 128,
+    'batch_size_train': 256,
+    'embedding_dim': 512,
+    'use_text': True,
+    'text_dim': 384,
+    
+    # K-Fold Configuration
+    'n_splits': 3,
+    'random_state': 42,
+    
+    # Deep MLP with additional layers
+    'mlp_hidden_dims': [512, 256, 128, 64],
+    'mlp_dropout': 0.4,
+    'mlp_l2_reg': 1e-4,
+    
+    # Training
+    'epochs': 40,
+    'learning_rate': 1e-3,
+    'patience': 8,
+    'loss_fn': 'huber',
+    'log_transform_price': True,
+    'price_clip_percentile': (1, 99),
+    
+    # Hardware
+    'use_gpu': True,
+    'num_workers': 4,
+}
+
+os.makedirs(CONFIG['embeddings_dir'], exist_ok=True)
+
+
+# ============================================================================
+# DOMAIN-SPECIFIC FEATURE ENGINEERING
+# ============================================================================
+
+def extract_domain_features(df, embedding_dim=512, text_dim=384):
+    """Extract domain-specific features from catalog data."""
+    print(f"\n{'='*70}")
+    print(f"Extracting Domain-Specific Features")
+    print(f"{'='*70}")
+    
+    features = []
+    
+    for idx, row in df.iterrows():
+        feature_vec = []
+        
+        # Brand value (proxy: brand name length + uniqueness)
+        if 'brand' in df.columns and pd.notna(row['brand']):
+            brand_len = len(str(row['brand']))
+            brand_value = np.log1p(brand_len) / 10
+            feature_vec.append(brand_value)
+        else:
+            feature_vec.append(0.0)
+        
+        # Category-specific attributes
+        category_depth = 0
+        if 'category' in df.columns and pd.notna(row['category']):
+            category_str = str(row['category'])
+            category_depth = category_str.count('>') + category_str.count('|') + 1
+            category_depth = np.log1p(category_depth) / 5
+        feature_vec.append(category_depth)
+        
+        # Text length as proxy for product richness
+        text_length = 0
+        text_cols = ['product_name', 'description', 'catalog_content']
+        for col in text_cols:
+            if col in df.columns and pd.notna(row[col]):
+                text_length += len(str(row[col]))
+        
+        text_richness = np.log1p(text_length) / 100
+        feature_vec.append(min(text_richness, 1.0))
+        
+        # Product age / temporal features (if available)
+        if 'date_created' in df.columns and pd.notna(row['date_created']):
+            temporal_value = 0.5
+        else:
+            temporal_value = 0.0
+        feature_vec.append(temporal_value)
+        
+        # Stock/availability proxy (if exists)
+        if 'stock' in df.columns and pd.notna(row['stock']):
+            stock_val = min(float(row['stock']), 100) / 100
+        else:
+            stock_val = 0.5
+        feature_vec.append(stock_val)
+        
+        # Review score / quality proxy
+        if 'rating' in df.columns and pd.notna(row['rating']):
+            rating_norm = float(row['rating']) / 5.0
+        else:
+            rating_norm = 0.5
+        feature_vec.append(rating_norm)
+        
+        features.append(feature_vec)
+    
+    domain_features = np.array(features)
+    print(f"  ✓ Extracted {domain_features.shape[1]} domain features for {domain_features.shape[0]} samples")
+    print(f"  Feature dimensions: {domain_features.shape}")
+    
+    return domain_features
+
+
+# ============================================================================
+# HELPER FUNCTIONS (from original)
+# ============================================================================
+
+def get_image_path(row, data_dir):
+    """Extract image path from CSV row."""
+    if 'image_path' in row.index:
+        image_ref = row['image_path']
+    elif 'image_link' in row.index:
+        image_ref = row['image_link']
+    else:
+        raise ValueError("CSV must have either 'image_path' or 'image_link' column")
+    
+    if '/' in str(image_ref):
+        filename = str(image_ref).split('/')[-1]
+    else:
+        filename = str(image_ref)
+    
+    for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+        base_name = filename.rsplit('.', 1)[0]
+        image_path = os.path.join(data_dir, 'images', f"{base_name}{ext}")
+        
+        if os.path.exists(image_path):
+            return image_path
+        
+        image_path = os.path.join(data_dir, f"{base_name}{ext}")
+        if os.path.exists(image_path):
+            return image_path
+    
+    return None
+
+
+def precompute_embeddings_clip(csv_path, data_dir, output_path, batch_size=32, max_samples=None):
+    """Precompute image embeddings using CLIP model."""
+    print(f"\n{'='*70}")
+    print(f"Precomputing image embeddings: {csv_path}")
+    print(f"{'='*70}")
+    
+    try:
+        from transformers import CLIPProcessor, CLIPModel
+        import torch
+    except ImportError:
+        print("Installing transformers and torch...")
+        os.system("pip install transformers torch torchvision -q")
+        from transformers import CLIPProcessor, CLIPModel
+        import torch
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"  Device: {device}")
+    
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    model.eval()
+    
+    df = pd.read_csv(csv_path)
+    
+    if max_samples is not None:
+        df = df.head(max_samples)
+        print(f"  Limited to {len(df)} samples")
+    
+    embeddings = []
+    failed_count = 0
+    
+    for i in range(0, len(df), batch_size):
+        batch_df = df.iloc[i:i+batch_size]
+        images = []
+        
+        for _, row in batch_df.iterrows():
+            image_path = get_image_path(row, data_dir)
+            
+            if image_path and os.path.exists(image_path):
+                try:
+                    img = Image.open(image_path).convert('RGB')
+                    img = img.resize((CONFIG['image_size'], CONFIG['image_size']))
+                    images.append(img)
+                except Exception as e:
+                    failed_count += 1
+                    images.append(Image.new('RGB', (CONFIG['image_size'], CONFIG['image_size'])))
+            else:
+                failed_count += 1
+                images.append(Image.new('RGB', (CONFIG['image_size'], CONFIG['image_size'])))
+        
+        with torch.no_grad():
+            inputs = processor(images=images, return_tensors="pt", padding=True)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            img_embeds = model.get_image_features(**inputs).cpu().numpy()
+        
+        embeddings.append(img_embeds)
+        
+        if (i // batch_size + 1) % 10 == 0:
+            print(f"  Processed {min(i+batch_size, len(df))}/{len(df)} images")
+    
+    embeddings = np.vstack(embeddings)
+    np.save(output_path, embeddings)
+    print(f"✓ Saved {len(embeddings)} image embeddings to {output_path}")
+    print(f"  Embedding shape: {embeddings.shape}")
+    if failed_count > 0:
+        print(f"  ⚠ {failed_count} images failed to load")
+    
+    return embeddings
+
+
+def precompute_text_embeddings(csv_path, output_path, max_samples=None):
+    """Precompute text embeddings (384 dimensions)."""
+    print(f"\n{'='*70}")
+    print(f"Precomputing text embeddings: {csv_path}")
+    print(f"{'='*70}")
+    
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        print("Installing sentence-transformers...")
+        os.system("pip install sentence-transformers -q")
+        from sentence_transformers import SentenceTransformer
+    
+    df = pd.read_csv(csv_path)
+    
+    if max_samples is not None:
+        df = df.head(max_samples)
+        print(f"  Limited to {len(df)} samples")
+    
+    text_columns = []
+    possible_columns = ['catalog_content', 'category', 'brand', 'product_name', 'description']
+    
+    for col in possible_columns:
+        if col in df.columns:
+            text_columns.append(col)
+    
+    if not text_columns:
+        print(f"  ⚠ No text columns found. Skipping text embeddings.")
+        return None
+    
+    print(f"  Using text columns: {text_columns}")
+    
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    
+    texts = []
+    for _, row in df.iterrows():
+        text_parts = []
+        for col in text_columns:
+            if pd.notna(row[col]):
+                text_parts.append(str(row[col]))
+        
+        text = " ".join(text_parts) if text_parts else "unknown product"
+        texts.append(text)
+    
+    embeddings = model.encode(texts, show_progress_bar=True, batch_size=32)
+    
+    np.save(output_path, embeddings)
+    print(f"✓ Saved {len(embeddings)} text embeddings to {output_path}")
+    print(f"  Embedding shape: {embeddings.shape}")
+    
+    return embeddings
+
+
+def preprocess_prices(df, clip_percentile=(1, 99), log_transform=True):
+    """Clean and preprocess prices."""
+    prices = df['price'].values.astype(float)
+    
+    valid_mask = ~np.isnan(prices)
+    prices_valid = prices[valid_mask]
+    
+    if clip_percentile:
+        low, high = np.percentile(prices_valid, clip_percentile)
+        prices = np.clip(prices, low, high)
+        print(f"Clipped prices to [{low:.2f}, {high:.2f}]")
+    
+    if log_transform:
+        prices = np.log1p(prices)
+        print(f"Applied log1p transform to prices")
+    
+    return prices, prices_valid.min(), prices_valid.max()
+
+
+# ============================================================================
+# DEEP MLP ARCHITECTURE (4-5 Additional Layers)
+# ============================================================================
+
+def build_deep_mlp_regressor(embedding_dim, domain_features_dim=7, use_text=False, text_dim=384):
+    """Build Deep MLP with 6 hidden layers."""
+    input_dim = embedding_dim + domain_features_dim
+    if use_text:
+        input_dim += text_dim
+    
+    print(f"  Building Deep MLP with input_dim={input_dim}")
+    print(f"    Image embeddings: {embedding_dim}")
+    print(f"    Domain features: {domain_features_dim}")
+    print(f"    Text embeddings: {text_dim if use_text else 0}")
+    print(f"    Hidden layers: {CONFIG['mlp_hidden_dims']}")
+    
+    model = tf.keras.Sequential()
+    model.add(tf.keras.layers.Input(shape=(input_dim,)))
+    
+    # Hidden layers with L2 regularization
+    for i, hidden_dim in enumerate(CONFIG['mlp_hidden_dims']):
+        model.add(tf.keras.layers.Dense(
+            hidden_dim,
+            activation='relu',
+            kernel_regularizer=tf.keras.regularizers.l2(CONFIG['mlp_l2_reg']),
+            name=f'hidden_{i+1}'
+        ))
+        model.add(tf.keras.layers.BatchNormalization())
+        model.add(tf.keras.layers.Dropout(CONFIG['mlp_dropout']))
+    
+    # Output layer
+    model.add(tf.keras.layers.Dense(1, name='output'))
+    
+    return model
+
+
+def get_loss_fn(loss_type='huber'):
+    """Get robust loss function."""
+    if loss_type == 'huber':
+        return tf.keras.losses.Huber(delta=1.0)
+    elif loss_type == 'mae':
+        return tf.keras.losses.MeanAbsoluteError()
+    else:
+        return tf.keras.losses.MeanSquaredError()
+
+
+# ============================================================================
+# COMPREHENSIVE METRICS COMPUTATION
+# ============================================================================
+
+def compute_metrics(y_true, y_pred, price_min, price_max, original_prices=None):
+    """Compute comprehensive evaluation metrics."""
+    
+    # Basic regression metrics
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(y_true - y_pred))
+    r2 = r2_score(y_true, y_pred)
+    
+    # MAPE (handle zeros)
+    mask = y_true != 0
+    if np.sum(mask) > 0:
+        mape = mean_absolute_percentage_error(y_true[mask], y_pred[mask])
+    else:
+        mape = np.inf
+    
+    # Price bucket accuracy (divide into 5 buckets)
+    buckets = np.percentile(y_true, [20, 40, 60, 80, 100])
+    y_true_bucket = np.digitize(y_true, buckets)
+    y_pred_bucket = np.digitize(y_pred, buckets)
+    bucket_accuracy = np.mean(y_true_bucket == y_pred_bucket)
+    
+    # Prediction range
+    pred_min = np.min(y_pred)
+    pred_max = np.max(y_pred)
+    pred_range = pred_max - pred_min
+    true_range = np.max(y_true) - np.min(y_true)
+    range_ratio = pred_range / (true_range + 1e-6)
+    
+    # Mean absolute error percentage
+    mape_alt = np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + 1e-6))) * 100
+    
+    metrics = {
+        'RMSE': rmse,
+        'MAE': mae,
+        'R²': r2,
+        'MAPE': mape,
+        'MAPE_alt': mape_alt,
+        'Bucket_Accuracy': bucket_accuracy,
+        'Range_Ratio': range_ratio,
+        'Pred_Min': pred_min,
+        'Pred_Max': pred_max,
+        'True_Min': np.min(y_true),
+        'True_Max': np.max(y_true),
+    }
+    
+    return metrics
+
+
+def print_metrics(metrics, fold_num=None):
+    """Print metrics in readable format."""
+    prefix = f"Fold {fold_num}: " if fold_num is not None else ""
+    print(f"\n{prefix}Evaluation Metrics:")
+    print(f"  RMSE:            {metrics['RMSE']:.4f}")
+    print(f"  MAE:             {metrics['MAE']:.4f}")
+    print(f"  R²:              {metrics['R²']:.4f}")
+    print(f"  MAPE:            {metrics['MAPE']:.4f}")
+    print(f"  MAPE (alt):      {metrics['MAPE_alt']:.4f}%")
+    print(f"  Bucket Accuracy: {metrics['Bucket_Accuracy']:.4f}")
+    print(f"  Range Ratio:     {metrics['Range_Ratio']:.4f}")
+    print(f"  Prediction Range: [{metrics['Pred_Min']:.4f}, {metrics['Pred_Max']:.4f}]")
+    print(f"  True Value Range: [{metrics['True_Min']:.4f}, {metrics['True_Max']:.4f}]")
+
+
+# ============================================================================
+# K-FOLD CROSS-VALIDATION TRAINING
+# ============================================================================
+
+def train_kfold_mlp(train_embeddings, train_prices, domain_features, 
+                    text_embeddings=None, val_split=0.1):
+    """Train MLP with K-Fold cross-validation."""
+    print(f"\n{'='*70}")
+    print(f"K-Fold Cross-Validation Training (K={CONFIG['n_splits']})")
+    print(f"{'='*70}")
+    
+    # Combine all features
+    if text_embeddings is not None and CONFIG['use_text']:
+        X = np.hstack([train_embeddings, domain_features, text_embeddings])
+        print(f"  Combined features: image ({train_embeddings.shape[1]}) + domain ({domain_features.shape[1]}) + text ({text_embeddings.shape[1]})")
+    else:
+        X = np.hstack([train_embeddings, domain_features])
+        print(f"  Combined features: image ({train_embeddings.shape[1]}) + domain ({domain_features.shape[1]})")
+    
+    y = train_prices.reshape(-1, 1)
+    
+    print(f"  Total samples: {len(X)}")
+    print(f"  Feature dimension: {X.shape[1]}")
+    
+    # Initialize K-Fold
+    kfold = KFold(n_splits=CONFIG['n_splits'], shuffle=True, random_state=CONFIG['random_state'])
+    
+    fold_models = []
+    fold_metrics = []
+    all_val_preds = []
+    all_val_true = []
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(kfold.split(X)):
+        print(f"\n{'─'*70}")
+        print(f"Fold {fold_idx + 1}/{CONFIG['n_splits']}")
+        print(f"{'─'*70}")
+        
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+        
+        print(f"  Train set: {X_train.shape[0]} samples")
+        print(f"  Val set:   {X_val.shape[0]} samples")
+        
+        # Normalize features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+        
+        # Build model
+        model = build_deep_mlp_regressor(
+            CONFIG['embedding_dim'],
+            domain_features_dim=domain_features.shape[1],
+            use_text=CONFIG['use_text'] and text_embeddings is not None,
+            text_dim=CONFIG['text_dim']
+        )
+        
+        loss_fn = get_loss_fn(CONFIG['loss_fn'])
+        optimizer = tf.keras.optimizers.Adam(learning_rate=CONFIG['learning_rate'])
+        
+        model.compile(optimizer=optimizer, loss=loss_fn, metrics=['mae'])
+        
+        # Callbacks
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=CONFIG['patience'],
+                restore_best_weights=True,
+                verbose=0
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6,
+                verbose=0
+            ),
+        ]
+        
+        # Train
+        history = model.fit(
+            X_train_scaled, y_train,
+            validation_data=(X_val_scaled, y_val),
+            batch_size=CONFIG['batch_size_train'],
+            epochs=CONFIG['epochs'],
+            callbacks=callbacks,
+            verbose=0
+        )
+        
+        # Validation predictions
+        val_preds = model.predict(X_val_scaled, batch_size=256, verbose=0).flatten()
+        
+        # Compute metrics
+        metrics = compute_metrics(y_val.flatten(), val_preds, None, None)
+        print_metrics(metrics, fold_idx + 1)
+        
+        fold_models.append(model)
+        fold_metrics.append(metrics)
+        all_val_preds.extend(val_preds)
+        all_val_true.extend(y_val.flatten())
+
+    print(f"  Aggregated Results (Average across {CONFIG['n_splits']} folds)")
+    print(f"{'='*70}")
+    
+    avg_metrics = {
+        'RMSE': np.mean([m['RMSE'] for m in fold_metrics]),
+        'MAE': np.mean([m['MAE'] for m in fold_metrics]),
+        'R²': np.mean([m['R²'] for m in fold_metrics]),
+        'MAPE': np.mean([m['MAPE'] for m in fold_metrics]),
+        'MAPE_alt': np.mean([m['MAPE_alt'] for m in fold_metrics]),
+        'Bucket_Accuracy': np.mean([m['Bucket_Accuracy'] for m in fold_metrics]),
+        'Range_Ratio': np.mean([m['Range_Ratio'] for m in fold_metrics]),
+        'Pred_Min': np.mean([m['Pred_Min'] for m in fold_metrics]),
+        'Pred_Max': np.mean([m['Pred_Max'] for m in fold_metrics]),
+        'True_Min': np.mean([m['True_Min'] for m in fold_metrics]),
+        'True_Max': np.mean([m['True_Max'] for m in fold_metrics]),
+    }
+    
+    print_metrics(avg_metrics)
+    
+    return fold_models, fold_metrics, avg_metrics
+
+
+# ============================================================================
+# ENSEMBLE INFERENCE
+# ============================================================================
+
+def inference_ensemble(fold_models, test_embeddings, domain_features_test, 
+                       test_csv, text_embeddings=None, price_min=None, price_max=None):
+    """Run ensemble inference using all fold models."""
+    print(f"\n{'='*70}")
+    print(f"Ensemble Inference on Test Set")
+    print(f"{'='*70}")
+    
+    # Combine features
+    if text_embeddings is not None and CONFIG['use_text']:
+        if test_embeddings.shape[0] != text_embeddings.shape[0]:
+            min_size = min(test_embeddings.shape[0], text_embeddings.shape[0])
+            test_embeddings = test_embeddings[:min_size]
+            text_embeddings = text_embeddings[:min_size]
+            domain_features_test = domain_features_test[:min_size]
+            print(f"  ✓ Truncated to {min_size} samples")
+        
+        X_test = np.hstack([test_embeddings, domain_features_test, text_embeddings])
+        print(f"  Combined test features: {X_test.shape}")
+    else:
+        min_size = min(test_embeddings.shape[0], domain_features_test.shape[0])
+        test_embeddings = test_embeddings[:min_size]
+        domain_features_test = domain_features_test[:min_size]
+        X_test = np.hstack([test_embeddings, domain_features_test])
+        print(f"  Combined test features: {X_test.shape}")
+    
+    # Normalize using each fold's data (simple approach: use average)
+    scaler = StandardScaler()
+    scaler.fit(X_test)  # Fit on test data for consistency
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Ensemble predictions
+    ensemble_preds = []
+    print(f"  Running predictions from {len(fold_models)} fold models...")
+    
+    for fold_idx, model in enumerate(fold_models):
+        preds = model.predict(X_test_scaled, batch_size=256, verbose=0).flatten()
+        ensemble_preds.append(preds)
+        print(f"    Fold {fold_idx + 1} predictions: min={preds.min():.2f}, max={preds.max():.2f}")
+    
+    # Average ensemble predictions
+    predictions = np.mean(ensemble_preds, axis=0)
+    print(f"\n  Ensemble average predictions: min={predictions.min():.2f}, max={predictions.max():.2f}")
+    
+    # Inverse log transform
+    if CONFIG['log_transform_price']:
+        predictions = np.expm1(predictions)
+    
+    # Clip to price range
+    if price_min is not None and price_max is not None:
+        predictions = np.clip(predictions, price_min, price_max)
+    
+    # Load test CSV and create output
+    df_test = pd.read_csv(CONFIG['csv_test'])
+    
+    if len(df_test) > len(predictions):
+        print(f"  ⚠ Truncating test CSV from {len(df_test)} to {len(predictions)} rows")
+        df_test = df_test.head(len(predictions))
+    
+    if 'sample_id' in df_test.columns:
+        sample_ids = df_test['sample_id'].values
+    elif 'id' in df_test.columns:
+        sample_ids = df_test['id'].values
+    else:
+        sample_ids = np.arange(len(predictions))
+    
+    output_df = pd.DataFrame({
+        'sample_id': sample_ids,
+        'price': predictions
+    })
+    
+    assert len(sample_ids) == len(predictions), f"Size mismatch: {len(sample_ids)} vs {len(predictions)}"
+    
+    output_path = os.path.join(CONFIG['data_dir'], 'predictions.csv')
+    output_df.to_csv(output_path, index=False)
+    
+    print(f"\n✓ Ensemble predictions saved to: {output_path}")
+    print(f"  Total predictions: {len(output_df)}")
+    print(f"  Prediction range: [{predictions.min():.2f}, {predictions.max():.2f}]")
+    
+    return output_df
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
+def main():
+    """Execute full enhanced pipeline."""
+    
+    print("\n" + "="*70)
+    print("K-FOLD CV WITH DEEP MLP & COMPREHENSIVE METRICS")
+    print("="*70)
+    
+    # Step 1: Load and preprocess data
+    print(f"\n[1/7] Loading training data...")
+    df_train = pd.read_csv(CONFIG['csv_train'])
+    print(f"  Total training samples: {len(df_train)}")
+    
+    if CONFIG['max_train_samples']:
+        df_train = df_train.head(CONFIG['max_train_samples'])
+        print(f"  ✓ Limited to {len(df_train)} training samples")
+    
+    print(f"\n[2/7] Preprocessing prices...")
+    train_prices, price_min, price_max = preprocess_prices(
+        df_train,
+        clip_percentile=CONFIG['price_clip_percentile'],
+        log_transform=CONFIG['log_transform_price']
+    )
+    
+    if len(train_prices) > len(df_train):
+        train_prices = train_prices[:len(df_train)]
+    
+    # Step 2: Extract domain features
+    print(f"\n[3/7] Extracting domain-specific features...")
+    domain_features_train = extract_domain_features(df_train)
+    
+    # Step 3: Precompute image embeddings
+    print(f"\n[4/7] Precomputing image embeddings...")
+    
+    if not os.path.exists(CONFIG['embeddings_train_npy']):
+        train_embeddings = precompute_embeddings_clip(
+            CONFIG['csv_train'],
+            CONFIG['data_dir'],
+            CONFIG['embeddings_train_npy'],
+            batch_size=CONFIG['batch_size_precompute'],
+            max_samples=CONFIG.get('max_train_samples')
+        )
+    else:
+        train_embeddings = np.load(CONFIG['embeddings_train_npy'])
+        print(f"  ✓ Loaded precomputed train embeddings: {train_embeddings.shape}")
+        if CONFIG['max_train_samples']:
+            train_embeddings = train_embeddings[:CONFIG['max_train_samples']]
+    
+    df_test = pd.read_csv(CONFIG['csv_test'])
+    if CONFIG['max_test_samples']:
+        df_test = df_test.head(CONFIG['max_test_samples'])
+    
+    if not os.path.exists(CONFIG['embeddings_test_npy']):
+        test_embeddings = precompute_embeddings_clip(
+            CONFIG['csv_test'],
+            CONFIG['data_dir'],
+            CONFIG['embeddings_test_npy'],
+            batch_size=CONFIG['batch_size_precompute'],
+            max_samples=CONFIG.get('max_test_samples')
+        )
+    else:
+        test_embeddings = np.load(CONFIG['embeddings_test_npy'])
+        print(f"  ✓ Loaded precomputed test embeddings: {test_embeddings.shape}")
+        if CONFIG['max_test_samples']:
+            test_embeddings = test_embeddings[:CONFIG['max_test_samples']]
+    
+    # Step 4: Extract test domain features
+    print(f"\n[5/7] Extracting test domain features...")
+    domain_features_test = extract_domain_features(df_test)
+    
+    # Step 5: Precompute text embeddings
+    text_train_embeddings = None
+    text_test_embeddings = None
+    
+    if CONFIG['use_text']:
+        if not os.path.exists(CONFIG['text_embeddings_train']):
+            text_train_embeddings = precompute_text_embeddings(
+                CONFIG['csv_train'],
+                CONFIG['text_embeddings_train'],
+                max_samples=CONFIG.get('max_train_samples')
+            )
+        else:
+            text_train_embeddings = np.load(CONFIG['text_embeddings_train'])
+            print(f"  ✓ Loaded train text embeddings: {text_train_embeddings.shape}")
+            if CONFIG['max_train_samples']:
+                text_train_embeddings = text_train_embeddings[:CONFIG['max_train_samples']]
+        
+        if not os.path.exists(CONFIG['text_embeddings_test']):
+            text_test_embeddings = precompute_text_embeddings(
+                CONFIG['csv_test'],
+                CONFIG['text_embeddings_test'],
+                max_samples=CONFIG.get('max_test_samples')
+            )
+        else:
+            text_test_embeddings = np.load(CONFIG['text_embeddings_test'])
+            print(f"  ✓ Loaded test text embeddings: {text_test_embeddings.shape}")
+            if CONFIG['max_test_samples']:
+                text_test_embeddings = text_test_embeddings[:CONFIG['max_test_samples']]
+    
+    # Step 6: K-Fold Cross-Validation Training
+    print(f"\n[6/7] K-Fold Cross-Validation Training...")
+    fold_models, fold_metrics, avg_metrics = train_kfold_mlp(
+        train_embeddings,
+        train_prices,
+        domain_features_train,
+        text_embeddings=text_train_embeddings,
+        val_split=0.1
+    )
+    
+    # Step 7: Ensemble Inference
+    print(f"\n[7/7] Running ensemble inference on test set...")
+    df_predictions = inference_ensemble(
+        fold_models,
+        test_embeddings,
+        domain_features_test,
+        CONFIG['csv_test'],
+        text_embeddings=text_test_embeddings,
+        price_min=price_min,
+        price_max=price_max
+    )
+    
+    # Summary Report
+    print(f"\n{'='*70}")
+    print(f"PIPELINE COMPLETE - SUMMARY REPORT")
+    print(f"{'='*70}")
+    print(f"✓ Training samples: {len(df_train)}")
+    print(f"✓ Test samples: {len(df_test)}")
+    print(f"✓ K-Fold splits: {CONFIG['n_splits']}")
+    print(f"✓ Hidden layer dimensions: {CONFIG['mlp_hidden_dims']}")
+    print(f"✓ Total parameters in each model: ~{estimate_parameters()} thousand")
+    print(f"✓ Ensemble models trained: {len(fold_models)}")
+    print(f"✓ Predictions saved to: {os.path.join(CONFIG['data_dir'], 'predictions.csv')}")
+    print(f"\nAverage Cross-Validation Metrics:")
+    print(f"  • RMSE:            {avg_metrics['RMSE']:.4f}")
+    print(f"  • MAE:             {avg_metrics['MAE']:.4f}")
+    print(f"  • R²:              {avg_metrics['R²']:.4f}")
+    print(f"  • MAPE:            {avg_metrics['MAPE']:.4f}")
+    print(f"  • Bucket Accuracy: {avg_metrics['Bucket_Accuracy']:.4f}")
+    print(f"{'='*70}\n")
+
+
+def estimate_parameters():
+    """Estimate total model parameters."""
+    input_dim = CONFIG['embedding_dim'] + 7  # domain features
+    if CONFIG['use_text']:
+        input_dim += CONFIG['text_dim']
+    
+    total = 0
+    prev_dim = input_dim
+    
+    for hidden_dim in CONFIG['mlp_hidden_dims']:
+        total += prev_dim * hidden_dim + hidden_dim  # weights + bias
+        prev_dim = hidden_dim
+    
+    total += prev_dim * 1 + 1  # output layer
+    
+    return total // 1000
+
+
+if __name__ == "__main__":
+    main()
