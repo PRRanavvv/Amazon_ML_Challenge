@@ -29,6 +29,10 @@ CONFIG = {
     # Sample limits
     'max_train_samples': 75,
     'max_test_samples': 10,
+     
+
+    'use_structured_catalog_features': True,  # NEW
+    'use_catalog_embeddings': True,
     
     # Model config - IMPROVED
     'image_size': 224,
@@ -409,7 +413,7 @@ def precompute_image_embeddings(df, image_folder, available_images, output_path,
 
 
 def precompute_text_embeddings(df, output_path):
-    """Extract text features from catalog_content."""
+    """Extract text features from catalog_content with structured parsing."""
     print(f"\n{'='*70}")
     print(f"Computing text embeddings for {len(df)} samples")
     print(f"{'='*70}")
@@ -423,11 +427,17 @@ def precompute_text_embeddings(df, output_path):
     
     model = SentenceTransformer('all-MiniLM-L6-v2')
     
+    # ENHANCED: Extract catalog content with better preprocessing
     texts = []
     for _, row in df.iterrows():
         text = str(row.get('catalog_content', ''))
         if not text or text == 'nan':
             text = "unknown product"
+        # ADD: Enhance text with column information if available
+        if 'company' in row and str(row['company']) != 'nan':
+            text = f"company: {row['company']} " + text
+        if 'quantity' in row and str(row['quantity']) != 'nan':
+            text = text + f" quantity: {row['quantity']}"
         texts.append(text)
     
     embeddings = model.encode(texts, show_progress_bar=True, batch_size=32)
@@ -437,6 +447,65 @@ def precompute_text_embeddings(df, output_path):
     
     return embeddings
 
+def extract_structured_features(df):
+    """
+    Extract structured features from catalog_content column.
+    Returns numerical features for: description_length, company_encoding, quantity
+    """
+    print(f"\n{'='*70}")
+    print(f"Extracting structured features from catalog_content")
+    print(f"{'='*70}")
+    
+    structured_features = []
+    
+    for idx, row in df.iterrows():
+        features = []
+        
+        # Feature 1: Description length
+        catalog_text = str(row.get('catalog_content', '')) if 'catalog_content' in df.columns else ''
+        desc_length = len(catalog_text) if catalog_text and catalog_text != 'nan' else 0
+        features.append(desc_length)
+        
+        # Feature 2: Word count
+        word_count = len(catalog_text.split()) if catalog_text and catalog_text != 'nan' else 0
+        features.append(word_count)
+        
+        # Feature 3: Company encoding
+        if 'company' in df.columns:
+            company = str(row['company'])
+            company_hash = hash(company) % 100 if company != 'nan' else 0
+            features.append(company_hash)
+        else:
+            features.append(0)
+        
+        # Feature 4: Quantity
+        if 'quantity' in df.columns:
+            try:
+                qty = float(row['quantity']) if str(row['quantity']) != 'nan' else 0
+                features.append(qty)
+            except (ValueError, TypeError):
+                features.append(0)
+        else:
+            features.append(0)
+        
+        # Feature 5-10: Keyword features
+        keywords = ['premium', 'bulk', 'wholesale', 'retail', 'limited', 'new']
+        catalog_lower = catalog_text.lower() if catalog_text else ''
+        keyword_features = [1.0 if kw in catalog_lower else 0.0 for kw in keywords]
+        features.extend(keyword_features)
+        
+        structured_features.append(features)
+    
+    structured_features = np.array(structured_features, dtype=np.float32)
+    print(f"✓ Extracted {len(structured_features)} structured features: {structured_features.shape}")
+    
+    return structured_features
+
+def precompute_structured_features(df, output_path):
+    """Precompute and save structured catalog features."""
+    features = extract_structured_features(df)
+    np.save(output_path, features)
+    return features
 
 # ============================================================================
 # ENSEMBLE MODEL ARCHITECTURES
@@ -761,7 +830,31 @@ def inference_ensemble(models, test_embeddings, df_test, price_min, price_max):
     
     return df_test
 
-
+def validate_and_align_embeddings(embeddings_dict, df_dict, stage='train'):
+    """
+    Validate that all embeddings match DataFrame size.
+    Truncate to minimum if mismatch exists.
+    """
+    print(f"\n{'='*70}")
+    print(f"Validating {stage} embeddings alignment")
+    print(f"{'='*70}")
+    
+    df_size = len(df_dict)
+    print(f"  DataFrame size: {df_size}")
+    
+    aligned_embeddings = {}
+    for name, emb in embeddings_dict.items():
+        if emb is not None:
+            if len(emb) != df_size:
+                print(f"  ⚠ {name}: size mismatch ({len(emb)} vs {df_size})")
+                # Truncate to match DataFrame
+                aligned_embeddings[name] = emb[:df_size]
+                print(f"    → Truncated to {df_size}")
+            else:
+                aligned_embeddings[name] = emb
+                print(f"  ✓ {name}: {emb.shape}")
+    
+    return aligned_embeddings
 # ============================================================================
 # MAIN PIPELINE
 # ============================================================================
@@ -834,6 +927,55 @@ def main():
             test_text_emb = np.load(test_text_emb_path)
             print(f"  ✓ Loaded test text embeddings: {test_text_emb.shape}")
     
+    train_struct_path = './embeddings/train_structured.npy'
+    test_struct_path = './embeddings/test_structured.npy'
+    
+    if not os.path.exists(train_struct_path):
+        train_struct_feat = precompute_structured_features(df_train, train_struct_path)
+    else:
+        train_struct_feat = np.load(train_struct_path)
+        print(f"  ✓ Loaded train structured features: {train_struct_feat.shape}")
+    
+    if not os.path.exists(test_struct_path):
+        test_struct_feat = precompute_structured_features(df_test, test_struct_path)
+    else:
+        test_struct_feat = np.load(test_struct_path)
+        print(f"  ✓ Loaded test structured features: {test_struct_feat.shape}")
+        
+    print(f"\n[4.5/7] Validating embedding dimensions...")
+    train_emb_dict = {
+        'image': train_img_emb,
+        'text': train_text_emb if CONFIG['use_text_features'] else None,
+        'structured': train_struct_feat,
+        'ocr': train_ocr_emb if CONFIG['use_ocr_features'] else None,
+    }
+    
+    train_emb_dict = validate_and_align_embeddings(train_emb_dict, df_train, 'TRAIN')
+    
+    # Validate test embeddings
+    test_emb_dict = {
+        'image': test_img_emb,
+        'text': test_text_emb if CONFIG['use_text_features'] else None,
+        'structured': test_struct_feat,
+        'ocr': test_ocr_emb if CONFIG['use_ocr_features'] else None,
+    }
+    
+    test_emb_dict = validate_and_align_embeddings(test_emb_dict, df_test, 'TEST')
+    
+    # Extract validated embeddings
+    train_img_emb = train_emb_dict['image']
+    test_img_emb = test_emb_dict['image']
+    
+    if CONFIG['use_text_features']:
+        train_text_emb = train_emb_dict['text']
+        test_text_emb = test_emb_dict['text']
+    
+    train_struct_feat = train_emb_dict['structured']
+    test_struct_feat = test_emb_dict['structured']
+    
+    if CONFIG['use_ocr_features']:
+        train_ocr_emb = train_emb_dict['ocr']
+        test_ocr_emb = test_emb_dict['ocr']
     # OCR embeddings
     train_ocr_emb_path = './embeddings/train_ocr.npy'
     test_ocr_emb_path = './embeddings/test_ocr.npy'
@@ -868,6 +1010,11 @@ def main():
         embedding_list_train.append(train_text_emb)
         embedding_list_test.append(test_text_emb)
         print(f"  ✓ Added catalog text embeddings")
+    
+    # ADD THIS: Include structured catalog features
+    embedding_list_train.append(train_struct_feat)
+    embedding_list_test.append(test_struct_feat)
+    print(f"  ✓ Added structured catalog features (desc, company, quantity, keywords)")
     
     if CONFIG['use_ocr_features']:
         embedding_list_train.append(train_ocr_emb)
