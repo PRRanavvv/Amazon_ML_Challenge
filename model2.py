@@ -1,10 +1,28 @@
 #!/usr/bin/env python3
 """
-FIXED: Multimodal Embedding → Regression Workflow
-Key fix: Corrected text embedding dimension from 512 to 384
+Optimized Multimodal Embedding → Regression Workflow
+========================================================
+CPU/MacBook-friendly pipeline for price prediction using precomputed embeddings.
+
+Features:
+- Efficient image streaming (tf.data or PyTorch)
+- Offline multimodal embedding computation (CLIP/ViT)
+- Small MLP regressor trained on frozen embeddings
+- Robust loss handling (Huber, MAE) for noisy labels
+- Optional semi-supervised pseudo-labeling
+- Fast inference on 95k test images
+
+Requirements:
+pip install tensorflow numpy pandas pillow torch torchvision transformers scikit-learn tqdm
+
+For Mac GPU (optional):
+pip install --upgrade tensorflow-macos tensorflow-metal
 """
 
+print("--- CHECKPOINT 1: SCRIPT EXECUTION STARTED ---") 
+
 import os
+import torch
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -13,33 +31,40 @@ from PIL import Image
 import warnings
 warnings.filterwarnings('ignore')
 
+
+print("--- CHECKPOINT 2: ALL LIBRARIES IMPORTED SUCCESSFULLY ---") 
+
 # ============================================================================
-# CONFIGURATION - FIXED TEXT DIMENSION
+# CONFIGURATION - UPDATED FOR FULL 75K DATASET RUN
 # ============================================================================
 
 CONFIG = {
-    # UPDATE THESE PATHS TO MATCH YOUR ACTUAL DATA LOCATION
-    'data_dir': r'C:\Users\rawat\Downloads\ml challenge\student_resource\dataset',
-    'csv_train': r'C:\Users\rawat\Downloads\ml challenge\student_resource\dataset\train.csv',
-    'csv_test': r'C:\Users\rawat\Downloads\ml challenge\student_resource\dataset\test.csv',
-    
-    # Sample limits
-    'max_train_samples': 300,  # Use 300 images for training
-    'max_test_samples': 100,   # Use 100 images for prediction
-    
+    # UPDATED PATHS for train_images and images_test folders
+    'data_dir': './',
+    'csv_train': './dataset/train1.csv',
+    'csv_test': './dataset/test1.csv',
+    'train_images_dir': './train_images',
+    'test_images_dir': './images_test',
     'embeddings_dir': './embeddings',
-    'embeddings_train_npy': './embeddings/train_embeddings.npy',
-    'embeddings_test_npy': './embeddings/test_embeddings.npy',
-    'text_embeddings_train': './embeddings/text_train_embeddings.npy',
-    'text_embeddings_test': './embeddings/text_test_embeddings.npy',
+
+    # UPDATED: Set to full 75k dataset
+    'max_train_samples': 75000,
+    'max_test_samples': 75000,
+
+    # UPDATED: Descriptive filenames for the full embeddings
+    'embeddings_train_npy': './embeddings/train_img_full.npy',
+    'embeddings_test_npy': './embeddings/test_img_full.npy',
+    'text_embeddings_train': './embeddings/text_train_full.npy',
+    'text_embeddings_test': './embeddings/text_test_full.npy',
+    'best_model_path': './best_model.h5',
     
-    # Model config - FIXED!
+    # Model config
     'image_size': 224,
     'batch_size_precompute': 32,
     'batch_size_train': 64,
-    'embedding_dim': 512,          # CLIP embedding dimension
+    'embedding_dim': 512,
     'use_text': True,
-    'text_dim': 384,               # FIXED: all-MiniLM-L6-v2 outputs 384 dims, not 512!
+    'text_dim': 384,
     'mlp_hidden_dim': 256,
     'mlp_dropout': 0.3,
     
@@ -47,54 +72,101 @@ CONFIG = {
     'epochs': 50,
     'learning_rate': 1e-3,
     'patience': 10,
-    'use_pseudo_labeling': False,
-    'pseudo_label_threshold': 0.7,
     'loss_fn': 'huber',
     'log_transform_price': True,
     'price_clip_percentile': (1, 99),
     
-    # Hardware
-    'use_gpu': True,
-    'num_workers': 4,
+    # Hardware - will default to CPU if GPU not found
+    'use_gpu': True, 
 }
 
+# This line should be right after the CONFIG block
 os.makedirs(CONFIG['embeddings_dir'], exist_ok=True)
 
 
 # ============================================================================
-# HELPER FUNCTIONS
+# 1. DATA LOADING & PREPROCESSING
 # ============================================================================
 
-def get_image_path(row, data_dir):
-    """Extract image path from CSV row."""
-    if 'image_path' in row.index:
-        image_ref = row['image_path']
-    elif 'image_link' in row.index:
-        image_ref = row['image_link']
-    else:
-        raise ValueError("CSV must have either 'image_path' or 'image_link' column")
-    
-    if '/' in str(image_ref):
-        filename = str(image_ref).split('/')[-1]
-    else:
-        filename = str(image_ref)
-    
-    for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
-        base_name = filename.rsplit('.', 1)[0]
-        image_path = os.path.join(data_dir, 'images', f"{base_name}{ext}")
+def load_and_preprocess_image(image_path, image_size=224, augment=False):
+    """Load and preprocess image to [0,1] range."""
+    try:
+        img = Image.open(image_path).convert('RGB')
+        img = img.resize((image_size, image_size), Image.BILINEAR)
+        img_array = np.array(img, dtype=np.float32) / 255.0
         
-        if os.path.exists(image_path):
-            return image_path
+        if augment:
+            # Random horizontal flip
+            if np.random.rand() > 0.5:
+                img_array = np.fliplr(img_array)
+            
+            # Random rotation [-10, 10] degrees
+            angle = np.random.uniform(-10, 10)
+            from scipy import ndimage
+            img_array = ndimage.rotate(img_array, angle, reshape=False, order=1)
+            
+            # Random brightness/contrast adjustment
+            brightness = np.random.uniform(0.8, 1.2)
+            contrast = np.random.uniform(0.8, 1.2)
+            img_array = np.clip(img_array * contrast + brightness - 1, 0, 1)
         
-        image_path = os.path.join(data_dir, f"{base_name}{ext}")
-        if os.path.exists(image_path):
-            return image_path
-    
-    return None
+        return img_array
+    except Exception as e:
+        print(f"Error loading {image_path}: {e}")
+        return None
 
 
-def precompute_embeddings_clip(csv_path, data_dir, output_path, batch_size=32, max_samples=None):
-    """Precompute image embeddings using CLIP model."""
+def create_tf_dataset(csv_path, batch_size, augment=False, shuffle=True, is_training=True):
+    """Create tf.data.Dataset for streaming images."""
+    df = pd.read_csv(csv_path, encoding='latin1')
+    
+    # Determine which image directory to use based on whether this is training or testing
+    image_dir = CONFIG['train_images_dir'] if is_training else CONFIG['test_images_dir']
+    
+    def load_fn(idx):
+        row = df.iloc[idx.numpy()]
+        
+        # Get image filename from image_link
+        image_ref = row.get('image_link', row.get('image_path', ''))
+        if image_ref and pd.notna(image_ref):
+            filename = str(image_ref).split('/')[-1]
+            image_path = os.path.join(image_dir, filename)
+        else:
+            # Fallback to sample_id if available
+            sample_id = row.get('sample_id', row.get('id', ''))
+            image_path = os.path.join(image_dir, f"{sample_id}.jpg")
+        
+        img = load_and_preprocess_image(image_path, CONFIG['image_size'], augment=augment)
+        
+        if img is None:
+            img = np.zeros((CONFIG['image_size'], CONFIG['image_size'], 3), dtype=np.float32)
+        
+        price = float(row.get('price', 0))
+        img_id = str(row.get('id', row.get('sample_id', '')))
+        
+        return img, price, img_id
+    
+    dataset = tf.data.Dataset.from_tensor_slices(np.arange(len(df)))
+    dataset = dataset.map(
+        lambda idx: tf.py_function(load_fn, [idx], [tf.float32, tf.float32, tf.string]),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    dataset = dataset.batch(batch_size, drop_remainder=False)
+    
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=min(1000, len(df)))
+    
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    
+    return dataset, df
+
+
+# ============================================================================
+# 2. PRECOMPUTE MULTIMODAL EMBEDDINGS (OFFLINE)
+# ============================================================================
+
+def precompute_embeddings_clip(csv_path, output_path, batch_size=32, is_training=True):
+    """Precompute image embeddings using CLIP model (offline)."""
     print(f"\n{'='*70}")
     print(f"Precomputing image embeddings: {csv_path}")
     print(f"{'='*70}")
@@ -107,128 +179,172 @@ def precompute_embeddings_clip(csv_path, data_dir, output_path, batch_size=32, m
         os.system("pip install transformers torch torchvision -q")
         from transformers import CLIPProcessor, CLIPModel
         import torch
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  Device: {device}")
+
+    gpus = tf.config.list_physical_devices('GPU')
+    device = "cuda" if torch.cuda.is_available() and CONFIG['use_gpu'] else "cpu"
+    print(f"  Using device: {device}")
     
     model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     model.eval()
     
-    df = pd.read_csv(csv_path)
-    
-    if max_samples is not None:
-        df = df.head(max_samples)
-        print(f"  Limited to {len(df)} samples")
-    
+    df = pd.read_csv(csv_path, encoding='latin1')
     embeddings = []
     failed_count = 0
     
-    for i in range(0, len(df), batch_size):
+    # Determine which image directory to use
+    image_dir = CONFIG['train_images_dir'] if is_training else CONFIG['test_images_dir']
+    
+    # Using tqdm for a progress bar
+    from tqdm import tqdm
+    for i in tqdm(range(0, len(df), batch_size), desc="Image Embedding"):
         batch_df = df.iloc[i:i+batch_size]
         images = []
         
         for _, row in batch_df.iterrows():
-            image_path = get_image_path(row, data_dir)
+            # Get image filename from image_link
+            image_ref = row.get('image_link', row.get('image_path', ''))
+            image_path = None
             
-            if image_path and os.path.exists(image_path):
-                try:
-                    img = Image.open(image_path).convert('RGB')
-                    img = img.resize((CONFIG['image_size'], CONFIG['image_size']))
+            if image_ref and pd.notna(image_ref):
+                filename = str(image_ref).split('/')[-1]
+                image_path = os.path.join(image_dir, filename)
+            else:
+                # Fallback to sample_id if available
+                sample_id = row.get('sample_id', row.get('id', ''))
+                image_path = os.path.join(image_dir, f"{sample_id}.jpg")
+            
+            try:
+                if os.path.exists(image_path):
+                    img = Image.open(image_path).convert('RGB').resize((CONFIG['image_size'], CONFIG['image_size']))
                     images.append(img)
-                except Exception as e:
+                else:
                     failed_count += 1
                     images.append(Image.new('RGB', (CONFIG['image_size'], CONFIG['image_size'])))
-            else:
+            except Exception:
                 failed_count += 1
                 images.append(Image.new('RGB', (CONFIG['image_size'], CONFIG['image_size'])))
-        
+
+        # --- THIS IS THE CORRECTED BLOCK ---
         with torch.no_grad():
             inputs = processor(images=images, return_tensors="pt", padding=True)
             inputs = {k: v.to(device) for k, v in inputs.items()}
+            # FIX: Corrected variable name and indentation
             img_embeds = model.get_image_features(**inputs).cpu().numpy()
-        
+        # ------------------------------------
+
         embeddings.append(img_embeds)
         
-        if (i // batch_size + 1) % 10 == 0:
-            print(f"  Processed {min(i+batch_size, len(df))}/{len(df)} images")
-    
     embeddings = np.vstack(embeddings)
     np.save(output_path, embeddings)
     print(f"✓ Saved {len(embeddings)} image embeddings to {output_path}")
-    print(f"  Embedding shape: {embeddings.shape}")
     if failed_count > 0:
-        print(f"  ⚠ {failed_count} images failed to load")
+        print(f"  ⚠ WARNING: {failed_count} images were missing or failed to load.")
     
-    return embeddings
+    return embeddings, []
 
 
-def precompute_text_embeddings(csv_path, output_path, max_samples=None):
-    """Precompute text embeddings (384 dimensions)."""
+# CHANGE 1: Line 213 - Added 'catalog_content' as first element in text_columns
+def precompute_text_embeddings(csv_path, output_path, text_columns=['catalog_content', 'category', 'brand']):
+    """Precompute text embeddings if metadata available."""
     print(f"\n{'='*70}")
     print(f"Precomputing text embeddings: {csv_path}")
+    print(f"Trying to use columns: {text_columns}")
     print(f"{'='*70}")
     
     try:
-        from sentence_transformers import SentenceTransformer
+        from transformers import AutoTokenizer, AutoModel
     except ImportError:
-        print("Installing sentence-transformers...")
-        os.system("pip install sentence-transformers -q")
-        from sentence_transformers import SentenceTransformer
+        print("Installing transformers...")
+        os.system("pip install transformers -q")
+        from transformers import AutoTokenizer, AutoModel
+
+    import torch 
     
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, encoding = 'latin1')
     
-    if max_samples is not None:
-        df = df.head(max_samples)
-        print(f"  Limited to {len(df)} samples")
-    
-    text_columns = []
-    possible_columns = ['catalog_content', 'category', 'brand', 'product_name', 'description']
-    
-    for col in possible_columns:
-        if col in df.columns:
-            text_columns.append(col)
-    
-    if not text_columns:
-        print(f"  ⚠ No text columns found. Skipping text embeddings.")
+    # Check if text columns exist
+    available_cols = [col for col in text_columns if col in df.columns]
+    if not available_cols:
+        print(f"No text columns {text_columns} found in CSV. Skipping text embeddings.")
         return None
     
-    print(f"  Using text columns: {text_columns}")
+    print(f"✓ Found columns: {available_cols}")
     
-    model = SentenceTransformer('all-MiniLM-L6-v2')
+    tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+    model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+    model.eval()
     
-    texts = []
-    for _, row in df.iterrows():
+    device = "cuda" if torch.cuda.is_available() and CONFIG['use_gpu'] else "cpu"
+    model = model.to(device)
+    
+    embeddings = []
+    
+    # CHANGE 2: Added progress tracking for text embedding
+    from tqdm import tqdm
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing text"):
+        # Concatenate available text columns
         text_parts = []
-        for col in text_columns:
+        for col in available_cols:
             if pd.notna(row[col]):
                 text_parts.append(str(row[col]))
         
-        text = " ".join(text_parts) if text_parts else "unknown product"
-        texts.append(text)
+        text = " ".join(text_parts) if text_parts else "unknown"
+        
+        # CHANGE 3: Line 239 - Increased max_length from 128 to 512
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        with tf.no_grad() if hasattr(tf, 'no_grad') else no_grad_context():
+            try:
+                import torch
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                    # Mean pooling for better representation
+                    embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+            except:
+                outputs = model(**inputs)
+                embedding = outputs.last_hidden_state.mean(dim=1).detach().cpu().numpy()
+        
+        embeddings.append(embedding)
     
-    embeddings = model.encode(texts, show_progress_bar=True, batch_size=32)
-    
+    embeddings = np.vstack(embeddings)
     np.save(output_path, embeddings)
     print(f"✓ Saved {len(embeddings)} text embeddings to {output_path}")
     print(f"  Embedding shape: {embeddings.shape}")
-    print(f"  Dimension: {embeddings.shape[1]} (should be 384)")
     
     return embeddings
 
+
+def no_grad_context():
+    """Dummy context manager for compatibility."""
+    class NoGrad:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+    return NoGrad()
+
+
+# ============================================================================
+# 3. PRICE PREPROCESSING & OUTLIER REMOVAL
+# ============================================================================
 
 def preprocess_prices(df, clip_percentile=(1, 99), log_transform=True):
     """Clean and preprocess prices."""
     prices = df['price'].values.astype(float)
     
+    # Remove NaN
     valid_mask = ~np.isnan(prices)
     prices_valid = prices[valid_mask]
     
+    # Clip outliers
     if clip_percentile:
         low, high = np.percentile(prices_valid, clip_percentile)
         prices = np.clip(prices, low, high)
         print(f"Clipped prices to [{low:.2f}, {high:.2f}]")
     
+    # Log transform to stabilize distribution
     if log_transform:
         prices = np.log1p(prices)
         print(f"Applied log1p transform to prices")
@@ -236,13 +352,18 @@ def preprocess_prices(df, clip_percentile=(1, 99), log_transform=True):
     return prices, prices_valid.min(), prices_valid.max()
 
 
+# ============================================================================
+# 4. BUILD MLP REGRESSOR
+# ============================================================================
+
+# CHANGE 4: Updated default text_dim to 384 (all-MiniLM-L6-v2 output dimension)
 def build_mlp_regressor(embedding_dim, use_text=False, text_dim=384):
-    """Build MLP regressor with correct dimensions."""
+    """Build lightweight MLP for regression on embeddings."""
     input_dim = embedding_dim
     if use_text:
         input_dim += text_dim
     
-    print(f"  Building MLP with input_dim={input_dim} (image:{embedding_dim} + text:{text_dim if use_text else 0})")
+    print(f"Building MLP with input_dim={input_dim} (image={embedding_dim}, text={text_dim if use_text else 0})")
     
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(input_dim,)),
@@ -250,14 +371,14 @@ def build_mlp_regressor(embedding_dim, use_text=False, text_dim=384):
         tf.keras.layers.Dropout(CONFIG['mlp_dropout']),
         tf.keras.layers.Dense(128, activation='relu'),
         tf.keras.layers.Dropout(CONFIG['mlp_dropout']),
-        tf.keras.layers.Dense(1)
+        tf.keras.layers.Dense(1)  # Regression output
     ])
     
     return model
 
 
 def get_loss_fn(loss_type='huber'):
-    """Get robust loss function."""
+    """Get robust loss function for noisy labels."""
     if loss_type == 'huber':
         return tf.keras.losses.Huber(delta=1.0)
     elif loss_type == 'mae':
@@ -266,21 +387,25 @@ def get_loss_fn(loss_type='huber'):
         return tf.keras.losses.MeanSquaredError()
 
 
+# ============================================================================
+# 5. TRAINING WITH CALLBACKS
+# ============================================================================
+
 def train_mlp(train_embeddings, train_prices, val_split=0.1, text_embeddings=None):
-    """Train MLP regressor."""
+    """Train MLP regressor on frozen embeddings."""
     print(f"\n{'='*70}")
     print(f"Training MLP Regressor")
     print(f"{'='*70}")
     
-    # Combine embeddings
+    # Combine image + text embeddings
     if text_embeddings is not None and CONFIG['use_text']:
-        print(f"  Image embeddings: {train_embeddings.shape}")
-        print(f"  Text embeddings: {text_embeddings.shape}")
         X = np.hstack([train_embeddings, text_embeddings])
-        print(f"  Combined embeddings: {X.shape}")
+        print(f"Combined embeddings shape: {X.shape}")
+        print(f"  - Image embeddings: {train_embeddings.shape}")
+        print(f"  - Text embeddings: {text_embeddings.shape}")
     else:
         X = train_embeddings
-        print(f"  Using only image embeddings: {X.shape}")
+        print(f"Using only image embeddings: {X.shape}")
     
     y = train_prices.reshape(-1, 1)
     
@@ -292,7 +417,7 @@ def train_mlp(train_embeddings, train_prices, val_split=0.1, text_embeddings=Non
     X_train, X_val = X[train_idx], X[val_idx]
     y_train, y_val = y[train_idx], y[val_idx]
     
-    print(f"  Train set: {X_train.shape}, Val set: {X_val.shape}")
+    print(f"Train set: {X_train.shape}, Val set: {X_val.shape}")
     
     # Build model
     model = build_mlp_regressor(
@@ -310,6 +435,7 @@ def train_mlp(train_embeddings, train_prices, val_split=0.1, text_embeddings=Non
         metrics=['mae']
     )
     
+    # Callbacks
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
             './best_model.h5',
@@ -332,6 +458,7 @@ def train_mlp(train_embeddings, train_prices, val_split=0.1, text_embeddings=Non
         ),
     ]
     
+    # Train
     history = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
@@ -346,67 +473,48 @@ def train_mlp(train_embeddings, train_prices, val_split=0.1, text_embeddings=Non
     return model, history
 
 
-def inference_on_test(model, test_embeddings, test_csv, text_embeddings=None, 
+# ============================================================================
+# 6. INFERENCE ON TEST SET - FULLY CORRECTED
+# ============================================================================
+
+def inference_on_test(model, test_embeddings, df_test, text_embeddings=None, 
                       price_min=None, price_max=None):
-    """Run inference on test set."""
+    """Fast inference on test set."""
     print(f"\n{'='*70}")
     print(f"Running Inference on Test Set")
     print(f"{'='*70}")
     
+    # Combine embeddings
     if text_embeddings is not None and CONFIG['use_text']:
-        # Safety check: ensure same number of samples
-        if test_embeddings.shape[0] != text_embeddings.shape[0]:
-            print(f"  ⚠ WARNING: Size mismatch detected!")
-            print(f"    Image embeddings: {test_embeddings.shape}")
-            print(f"    Text embeddings: {text_embeddings.shape}")
-            
-            # Truncate to minimum size
-            min_size = min(test_embeddings.shape[0], text_embeddings.shape[0])
-            test_embeddings = test_embeddings[:min_size]
-            text_embeddings = text_embeddings[:min_size]
-            print(f"  ✓ Truncated both to {min_size} samples")
-        
-        X_test = np.hstack([test_embeddings, text_embeddings])
-        print(f"  Combined test embeddings: {X_test.shape}")
+        # Ensure the number of rows match before combining
+        min_rows = min(len(test_embeddings), len(text_embeddings))
+        X_test = np.hstack([test_embeddings[:min_rows], text_embeddings[:min_rows]])
+        # Also truncate the dataframe to match
+        df_test = df_test.head(min_rows)
+        print(f"Combined test embeddings shape: {X_test.shape}")
     else:
         X_test = test_embeddings
-        print(f"  Using only image embeddings: {X_test.shape}")
+        print(f"Using only image embeddings: {X_test.shape}")
     
+    # Predict
     predictions = model.predict(X_test, batch_size=256, verbose=1)
     predictions = predictions.flatten()
     
+    # Inverse log transform if applied
     if CONFIG['log_transform_price']:
         predictions = np.expm1(predictions)
     
+    # Clip to observed range
     if price_min is not None and price_max is not None:
         predictions = np.clip(predictions, price_min, price_max)
     
-    df_test = pd.read_csv(test_csv)
+    # --- THIS IS THE FIX ---
+    # We DO NOT re-read the CSV. We use the df_test that was passed in.
+    df_test['price'] = predictions
     
-    # CRITICAL FIX: Truncate df_test to match the number of predictions
-    if len(df_test) > len(predictions):
-        print(f"  ⚠ Truncating test CSV from {len(df_test)} to {len(predictions)} rows to match predictions")
-        df_test = df_test.head(len(predictions))
-    
-    if 'sample_id' in df_test.columns:
-        sample_ids = df_test['sample_id'].values
-    elif 'id' in df_test.columns:
-        sample_ids = df_test['id'].values
-    else:
-        sample_ids = np.arange(len(predictions))
-    
-    output_df = pd.DataFrame({
-        'sample_id': sample_ids,
-        'price': predictions
-    })
-    
-    # Verify sizes match
-    assert len(sample_ids) == len(predictions), f"Size mismatch: {len(sample_ids)} IDs vs {len(predictions)} predictions"
-    print(f"  ✓ Created output with {len(output_df)} predictions")
-    
-    output_path = os.path.join(CONFIG['data_dir'], 'predictions.csv')
-    output_df.to_csv(output_path, index=False)
-    
+    output_path = './predictions.csv'
+    # FIX: Use 'sample_id' (from your CSV) and 'price' for the submission format
+    df_test[['sample_id', 'price']].to_csv(output_path, index=False)
     print(f"✓ Saved predictions to {output_path}")
     print(f"  Prediction range: [{predictions.min():.2f}, {predictions.max():.2f}]")
     
@@ -414,133 +522,74 @@ def inference_on_test(model, test_embeddings, test_csv, text_embeddings=None,
 
 
 # ============================================================================
-# MAIN PIPELINE
+# 7. MAIN PIPELINE - FULLY CORRECTED AND UPDATED
 # ============================================================================
 
 def main():
     """Execute full pipeline."""
-    
     print("\n" + "="*70)
-    print("FIXED: MULTIMODAL EMBEDDING → REGRESSION WORKFLOW")
+    print(f"UPDATED MULTIMODAL WORKFLOW ({CONFIG['max_train_samples']} SAMPLES)")
     print("="*70)
     
-    # Step 1: Load data
-    print(f"\n[1/6] Loading training data...")
-    df_train = pd.read_csv(CONFIG['csv_train'])
-    print(f"  Total training samples: {len(df_train)}")
-    
-    if 'max_train_samples' in CONFIG and CONFIG['max_train_samples']:
-        df_train = df_train.head(CONFIG['max_train_samples'])
-        print(f"  ✓ Limited to {len(df_train)} training samples")
-    
+    # Step 1: Load and sample data
+    print(f"\n[1/6] Loading and sampling data...")
+    df_train = pd.read_csv(CONFIG['csv_train'], encoding='latin1')
+    df_test = pd.read_csv(CONFIG['csv_test'], encoding='latin1')
+    print(f"  Original train/test sizes: {len(df_train)} / {len(df_test)}")
+
+    df_train = df_train.head(CONFIG['max_train_samples'])
+    df_test = df_test.head(CONFIG['max_test_samples'])
+    print(f"  ✓ Limited to {len(df_train)} train and {len(df_test)} test samples.")
+
     # Step 2: Preprocess prices
     print(f"\n[2/6] Preprocessing prices...")
-    train_prices, price_min, price_max = preprocess_prices(
-        df_train,
-        clip_percentile=CONFIG['price_clip_percentile'],
-        log_transform=CONFIG['log_transform_price']
-    )
+    train_prices, price_min, price_max = preprocess_prices(df_train)
     
-    # Ensure prices match the limited sample size
-    if len(train_prices) > len(df_train):
-        train_prices = train_prices[:len(df_train)]
-        print(f"  ✓ Truncated prices to match {len(train_prices)} samples")
-    
-    # Step 3: Precompute image embeddings
+    # Step 3 & 4: Precompute embeddings
     print(f"\n[3/6] Precomputing image embeddings...")
     
+    # Check if embeddings already exist
     if not os.path.exists(CONFIG['embeddings_train_npy']):
-        train_embeddings = precompute_embeddings_clip(
-            CONFIG['csv_train'],
-            CONFIG['data_dir'],
-            CONFIG['embeddings_train_npy'],
-            batch_size=CONFIG['batch_size_precompute'],
-            max_samples=CONFIG.get('max_train_samples', None)
-        )
+        train_embeddings, _ = precompute_embeddings_clip(CONFIG['csv_train'], CONFIG['embeddings_train_npy'], is_training=True)
     else:
         train_embeddings = np.load(CONFIG['embeddings_train_npy'])
         print(f"  ✓ Loaded precomputed train embeddings: {train_embeddings.shape}")
-        # Truncate to match max_train_samples if needed
-        if 'max_train_samples' in CONFIG and CONFIG['max_train_samples']:
-            train_embeddings = train_embeddings[:CONFIG['max_train_samples']]
-            print(f"  ✓ Truncated to {train_embeddings.shape[0]} samples")
-    
-    df_test = pd.read_csv(CONFIG['csv_test'])
-    if 'max_test_samples' in CONFIG and CONFIG['max_test_samples']:
-        df_test = df_test.head(CONFIG['max_test_samples'])
     
     if not os.path.exists(CONFIG['embeddings_test_npy']):
-        test_embeddings = precompute_embeddings_clip(
-            CONFIG['csv_test'],
-            CONFIG['data_dir'],
-            CONFIG['embeddings_test_npy'],
-            batch_size=CONFIG['batch_size_precompute'],
-            max_samples=CONFIG.get('max_test_samples', None)
-        )
+        test_embeddings, _ = precompute_embeddings_clip(CONFIG['csv_test'], CONFIG['embeddings_test_npy'], is_training=False)
     else:
         test_embeddings = np.load(CONFIG['embeddings_test_npy'])
         print(f"  ✓ Loaded precomputed test embeddings: {test_embeddings.shape}")
-        # Truncate to match max_test_samples if needed
-        if 'max_test_samples' in CONFIG and CONFIG['max_test_samples']:
-            test_embeddings = test_embeddings[:CONFIG['max_test_samples']]
-            print(f"  ✓ Truncated to {test_embeddings.shape[0]} samples")
-    
-    # Step 4: Precompute text embeddings
-    text_train_embeddings = None
-    text_test_embeddings = None
-    
+
+    print(f"\n[4/6] Precomputing text embeddings...")
+    text_train_embeddings, text_test_embeddings = None, None
     if CONFIG['use_text']:
         if not os.path.exists(CONFIG['text_embeddings_train']):
-            text_train_embeddings = precompute_text_embeddings(
-                CONFIG['csv_train'],
-                CONFIG['text_embeddings_train'],
-                max_samples=CONFIG.get('max_train_samples', None)
-            )
+            text_train_embeddings = precompute_text_embeddings(CONFIG['csv_train'], CONFIG['text_embeddings_train'])
         else:
             text_train_embeddings = np.load(CONFIG['text_embeddings_train'])
-            print(f"  ✓ Loaded train text embeddings: {text_train_embeddings.shape}")
-            # Truncate to match max_train_samples if needed
-            if 'max_train_samples' in CONFIG and CONFIG['max_train_samples']:
-                text_train_embeddings = text_train_embeddings[:CONFIG['max_train_samples']]
-                print(f"  ✓ Truncated to {text_train_embeddings.shape[0]} samples")
-        
+            print(f"  ✓ Loaded precomputed text train embeddings: {text_train_embeddings.shape}")
+            
         if not os.path.exists(CONFIG['text_embeddings_test']):
-            text_test_embeddings = precompute_text_embeddings(
-                CONFIG['csv_test'],
-                CONFIG['text_embeddings_test'],
-                max_samples=CONFIG.get('max_test_samples', None)
-            )
+            text_test_embeddings = precompute_text_embeddings(CONFIG['csv_test'], CONFIG['text_embeddings_test'])
         else:
             text_test_embeddings = np.load(CONFIG['text_embeddings_test'])
-            print(f"  ✓ Loaded test text embeddings: {text_test_embeddings.shape}")
-            # Truncate to match max_test_samples if needed
-            if 'max_test_samples' in CONFIG and CONFIG['max_test_samples']:
-                text_test_embeddings = text_test_embeddings[:CONFIG['max_test_samples']]
-                print(f"  ✓ Truncated to {text_test_embeddings.shape[0]} samples")
-    
+            print(f"  ✓ Loaded precomputed text test embeddings: {text_test_embeddings.shape}")
+
     # Step 5: Train MLP
-    print(f"\n[4/6] Training MLP regressor...")
-    model, history = train_mlp(
-        train_embeddings,
-        train_prices,
-        val_split=0.1,
-        text_embeddings=text_train_embeddings
-    )
+    print(f"\n[5/6] Training MLP regressor...")
+    model, history = train_mlp(train_embeddings, train_prices, text_embeddings=text_train_embeddings)
     
     # Step 6: Inference
-    print(f"\n[5/6] Running inference on test set...")
-    df_predictions = inference_on_test(
-        model,
-        test_embeddings,
-        CONFIG['csv_test'],
-        text_embeddings=text_test_embeddings,
-        price_min=price_min,
-        price_max=price_max
-    )
+    print(f"\n[6/6] Running inference on test set...")
+    inference_on_test(model, test_embeddings, df_test, text_embeddings=text_test_embeddings, price_min=price_min, price_max=price_max)
     
     print(f"\n[6/6] Pipeline complete!")
     print(f"{'='*70}")
-    print(f"✓ Predictions saved to: {os.path.join(CONFIG['data_dir'], 'predictions.csv')}")
+    print(f"Results:")
+    print(f"  - Predictions saved: ./predictions.csv")
+    print(f"  - Model saved: ./best_model.h5")
+    print(f"  - Embedding cache: {CONFIG['embeddings_dir']}/")
     print(f"{'='*70}\n")
 
 
